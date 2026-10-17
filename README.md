@@ -1,6 +1,6 @@
 # Dialogs++ for The Blood of Dawnwalker
 
-Descriptions here - nexus
+Descriptions here - [nexus](https://www.nexusmods.com/thebloodofdawnwalker/mods/756)
 
 ## File verification
 
