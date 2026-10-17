@@ -1,0 +1,12 @@
+version.dll
+version.lib
+version.exp
+*.obj
+
+
+debug.enable
+dw_dialogue_wheel.log
+
+# Editors
+.vs/
+*.user
