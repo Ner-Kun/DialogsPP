@@ -116,8 +116,8 @@ U.dialogueGone = function()
 end
 
 --- Progress signature of the current line: active response node + voice
---- section as one string, node guid alone as second return (the re-peek
---- key: sections churn inside one line, nodes don't). Unreadable step =
+--- section as one string, node guid alone as second return (first-line
+--- detection: sections churn inside one line, nodes don't). Unreadable step =
 --- nil, and the flight gate degrades to timeout-only. TICK CONTEXT ONLY:
 --- the click handler copies S.lineSig because engine calls in click
 --- context crashed the game.

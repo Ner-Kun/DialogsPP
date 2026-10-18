@@ -12,13 +12,10 @@ local function tick()
     S.tickCount = S.tickCount + 1
     local tickCount = S.tickCount
     local now = os.clock()
-    --[[ BIRTH LADDER DISABLED
-    if S.birthWatch then
-        S.birthWatch = nil
-        log("birth: first-tick")
-    end
-    --]]
     if (tickCount % 8) == 1 then conf.readConfig() end
+    -- Timed choice length rides the settings CDO; apply on boot and on every
+    -- live config change. The compare is pure Lua, the write one property op.
+    if S.timedAppliedSec ~= settings.TimerExtendSec then P.applyTimedDefault() end
     if S.graphFrozen and S.freezeAt ~= nil and (now - S.freezeAt) > S.FREEZE_CEIL then
         S.graphFrozen = false
         S.freezeAt = nil
@@ -63,8 +60,6 @@ local function tick()
         S.endStrikes = S.endStrikes + 1
         S.skipFlight = nil
         S.lineSig = nil
-        S.peekDone = nil
-        S.prevNodeGuid = nil
         S.skipBtnDone = nil
         S.lastSkipBtnSig = nil
         S.skipBtnBlocked = nil
@@ -346,9 +341,7 @@ local function tick()
         end
         -- Detect visible timers once per list; bypass confirm delay since the game auto-picks.
         -- Engine remaining time (0..1) drives the countdown heartbeat.
-        -- Census is fallback; lookahead writes before timer arming.
         if S.timedChoice == nil and not S.graphFrozen then
-            P.censusPrewrite()
             S.timedChoice = P.readTimedChoice()
             if S.timedChoice then
                 S.timedWatchT0 = now
@@ -409,17 +402,7 @@ local function tick()
             S.started = true
             log("dialogue started (first line)")
         end
-        -- Reset lookahead on each new node, regardless of who advanced the line.
-        -- Track node GUID only; voice sections change within a line.
-        -- no-response/nil signals teardown, not progress.
-        if S.lineGuid ~= S.prevNodeGuid then
-            if S.lineGuid ~= nil and S.lineGuid ~= "no-response" then
-                S.peekDone = nil
-            end
-            S.prevNodeGuid = S.lineGuid
-        end
         -- Line change confirms progress. Timeout alone never releases the skip gate: hammering skips into silence crashed the game.
-        local justConfirmed = false
         if S.skipFlight ~= nil then
             if S.skipFlight.sig == nil and S.lineSig ~= nil and S.lineSig ~= "no-response" then
                 S.skipFlight.sig = S.lineSig
@@ -428,7 +411,6 @@ local function tick()
             if S.lineSig ~= nil and S.skipFlight.sig ~= nil and S.lineSig ~= S.skipFlight.sig then
                 log("flight confirmed (progress)")
                 S.skipFlight = nil
-                justConfirmed = true
             elseif (now - S.skipFlight.t) > S.FLIGHT_HOLD then
                 log("flight hold expired")
                 S.skipFlight = nil
@@ -440,26 +422,6 @@ local function tick()
             elseif (now - S.skipFlight.t) > S.FLIGHT_TIMEOUT and not S.skipFlight.held then
                 S.skipFlight.held = true
                 log("flight timeout, holding")
-            end
-        end
-        -- Run lookahead immediately on transitions only: first line, choice return, or progress.
-        -- Its verdict never gates; Finish chains appear per line. Keep the walk for timer setup.
-        -- Run census here too: list-open writes are too late, after timer arming.
-        -- Keep the list-open call below as fallback.
-        if (S.peekDone ~= true or S.lastMode == S.MODE_OPTIONS or justConfirmed)
-            and not S.graphFrozen then
-            S.peekDone = true
-            P.censusPrewrite()
-            local verdict, trail, recipe, recipeTimed = P.peekAhead()
-
-            if verdict == "choice" and recipeTimed == true
-                and recipe ~= nil and recipe ~= S.lastRecipe then
-                S.lastRecipe = recipe
-                log("choice recipe: %s", recipe)
-                local defDur = P.readTimedDefault()
-                if defDur ~= nil then
-                    log("timed default: dur=%s", tostring(defDur))
-                end
             end
         end
         E.notify(S.MODE_DIALOGUE, "dialogue open")

@@ -243,53 +243,89 @@ P.readSkipButton = function()
     end
 end
 
---- CENSUS PREWRITE: enumerate future timed Choice nodes; graph walks read dangling children on newer UE4SS builds.
---- Match FullName paths only (ignore class prefix); filters templates, keeping live instances.
-P.censusPrewrite = function()
-    local sec = conf.settings.TimerExtendSec
-    if type(sec) ~= "number" or sec <= 0 then return end
-    if S.censusFired then return end
-    if type(FindAllOf) ~= "function" then return end
-    local dlg = S.seenDialogue
-    if not Usable(dlg) then return end
-    local cs = Try(function() return dlg.CinematicSystem end)
-    if not Usable(cs) then return end
-    local ad = Try(function() return cs.ActiveDialogue end)
-    if not Usable(ad) then return end
-    local adpath = Try(function() return ad:GetFullName() end)
-    if type(adpath) ~= "string" or adpath == "" then return end
+--- The settings CDO holds the timed-choice length the game arms from
+--- (section /Script/DialogueSystem.CinematicSettings - the value ini mods ship).
+--- Plain FindObject takes a class+name pair; full paths never hit (see
+--- util.refreshAnchor), so the Static paths go first. The property read
+--- validates a hit; success caches, misses log once and retry on a throttle.
+local function validateSettings(o)
+    if o == nil then return nil end
+    local v = Try(function() return o.DefaultTimedChoiceDuration end)
+    if type(v) == "number" then return o end
+    local cdo = Try(function() return o:GetDefaultObject() end)
+    if cdo ~= nil then
+        local v2 = Try(function() return cdo.DefaultTimedChoiceDuration end)
+        if type(v2) == "number" then return cdo end
+    end
+    return nil
+end
 
-    local adid = adpath:match("^%S+%s+(.+)$") or adpath
-    local ok, res = pcall(FindAllOf, "CinematicNode_Choice")
-    if not ok or res == nil then return end
-    local wrote = false
-    pcall(function()
-        for _, o in pairs(res) do
-            if Usable(o) then
-                local fn = Try(function() return o:GetFullName() end)
-                if type(fn) == "string" then
-                    local fnpath = fn:match("^%S+%s+(.+)$") or fn
-                    if fnpath:sub(1, #adid) == adid
-                    and not S.prewriteKeys[fn] then
-                        local td = Try(function() return o.TimedChoiceData end)
-                        if td ~= nil and Try(function() return td.bIsTimedChoice end) == true then
-                            S.prewriteKeys[fn] = true
-                            local oldOver = Try(function() return td.bOverrideDefaultDuration end)
-                            local oldDovr = Try(function() return td.DurationOverride end)
-                            local okO = pcall(function() td.bOverrideDefaultDuration = true end)
-                            local okD = pcall(function() td.DurationOverride = sec end)
-                            if okO and okD then wrote = true end
-                            log("timed prewrite: ok=%s over=%s->true dovr=%s->%s (census)",
-                                tostring(okO and okD), tostring(oldOver),
-                                tostring(oldDovr), tostring(sec))
-                        end
-                    end
-                end
-            end
+local function cineCdo()
+    if P._cineCdo ~= nil then return P._cineCdo end
+    local now = os.clock()
+    if P._cineRetryAt ~= nil and now < P._cineRetryAt then return nil end
+    P._cineRetryAt = now + 2.0
+    local cands = {}
+    if type(StaticFindObject) == "function" then
+        cands[#cands + 1] = { "static-cdo", function()
+            return StaticFindObject("/Script/DialogueSystem.Default__CinematicSettings")
+        end }
+        cands[#cands + 1] = { "static-class", function()
+            return StaticFindObject("/Script/DialogueSystem.CinematicSettings")
+        end }
+    end
+    if type(FindObject) == "function" then
+        cands[#cands + 1] = { "find-cdo", function()
+            return FindObject(nil, "Default__CinematicSettings", 0, 0)
+        end }
+        cands[#cands + 1] = { "find-class", function()
+            return FindObject(nil, "CinematicSettings", 0, 0)
+        end }
+    end
+    for _, c in ipairs(cands) do
+        local hit = validateSettings(Try(c[2]))
+        if hit ~= nil then
+            P._cineCdo = hit
+            log("timed default: cdo resolved (via %s)", c[1])
+            return P._cineCdo
         end
-    end)
-    res = nil
-    if wrote then S.censusFired = true end
+    end
+    if P._cineMissLogged ~= true then
+        P._cineMissLogged = true
+        log("timed default: cdo not found (static+find tried)")
+    end
+    return nil
+end
+
+--- Timed choice length: one property write on the settings CDO covers every
+--- future arming on every build - no per-node lookups, no enumeration.
+--- Nodes carrying bOverrideDefaultDuration keep their authored value.
+P.applyTimedDefault = function()
+    local sec = conf.settings.TimerExtendSec
+    if type(sec) ~= "number" then return end
+    local cdo = cineCdo()
+    if cdo == nil then return end
+    local cur = Try(function() return cdo.DefaultTimedChoiceDuration end)
+    if type(cur) ~= "number" then return end
+    if P._timedDefaultOrig == nil then P._timedDefaultOrig = cur end
+    -- 0 = vanilla: restore the value loaded at startup, never leave our number behind
+    local want = (sec > 0) and sec or P._timedDefaultOrig
+    if cur ~= want then
+        local clockNow = os.clock()
+        if P._writeRetryAt ~= nil and clockNow < P._writeRetryAt then return end
+        P._writeRetryAt = clockNow + 2.0
+        local ok = pcall(function() cdo.DefaultTimedChoiceDuration = want end)
+        local now = ok and Try(function() return cdo.DefaultTimedChoiceDuration end) or nil
+        log("timed default: %s -> %s ok=%s now=%s", tostring(cur), tostring(want),
+            tostring(ok), tostring(now))
+        if ok and now == want then S.timedAppliedSec = sec end
+        return
+    end
+    S.timedAppliedSec = sec
+    if S.timedDefaultLogged ~= want then
+        S.timedDefaultLogged = want
+        log("timed default: dur=%s (in place)", tostring(want))
+    end
 end
 
 
@@ -390,20 +426,6 @@ P.readFirstUnlocked = function()
     return false
 end
 
-P.readTimedDefault = function()
-    if P._cineSettingsClass == nil and type(FindObject) == "function" then
-        P._cineSettingsClass = Try(function()
-            return FindObject("/Script/DialogueSystem.CinematicSettings")
-        end)
-    end
-    if P._cineSettingsClass == nil then return nil end
-    local cdo = Try(function() return P._cineSettingsClass:GetDefaultObject() end)
-    if cdo == nil then return nil end
-    local v = Try(function() return cdo.DefaultTimedChoiceDuration end)
-    if type(v) == "number" then return v end
-    return nil
-end
-
 P.activeNodeClass = function()
     local dlg = S.seenDialogue
     if not Usable(dlg) then return nil end
@@ -418,86 +440,6 @@ P.activeNodeClass = function()
     local short = cls:gsub("CinematicNode_", ""):gsub("FlowNode_", ""):gsub("DialogueNode_", "")
     if short == "" then short = cls end
     return short
-end
-
-P.PEEK_DEPTH = 5
-
-P.peekAhead = function()
-    local dlg = S.seenDialogue
-    if not Usable(dlg) then return "more" end
-    local cs = Try(function() return dlg.CinematicSystem end)
-    if not Usable(cs) then return "more" end
-    local ad = Try(function() return cs.ActiveDialogue end)
-    if not Usable(ad) then return "more" end
-    local rn = Try(function() return ad:GetActiveResponseNode() end)
-    if not Usable(rn) then return "more" end
-    local seen = {}
-    local trail = {}
-    local recipe = nil
-    local recipeTimed = nil
-    local function readRecipe(nd)
-        local td = Try(function() return nd.TimedChoiceData end)
-        local timed, over, dovr = nil, nil, nil
-        if td ~= nil then
-            timed = Try(function() return td.bIsTimedChoice end)
-            over = Try(function() return td.bOverrideDefaultDuration end)
-            dovr = Try(function() return td.DurationOverride end)
-        end
-        recipeTimed = (timed == true)
-        local ndur = Try(function() return nd.TimedChoiceDuration end)
-        recipe = string.format("timed=%s override=%s dovr=%s nodedur=%s",
-            tostring(timed), tostring(over), tostring(dovr), tostring(ndur))
-    end
-    local function trailAdd(cls, note)
-        if #trail < 16 then
-            trail[#trail + 1] = tostring(cls) .. (note or "")
-        end
-    end
-    local function visit(nd, depth)
-        if not Usable(nd) then trailAdd("?", "?dead"); return "more" end
-        if depth > P.PEEK_DEPTH then trailAdd("?", "?deep"); return "more" end
-        local key = Try(function() return nd:GetFullName() end) or ""
-        if key ~= "" then
-            if seen[key] then trailAdd("?", "?loop"); return "more" end
-            seen[key] = true
-        end
-        local cls = Try(function() return nd:GetClass():GetFName():ToString() end)
-        cls = (type(cls) == "string") and cls or ""
-        local short = cls:gsub("CinematicNode_", ""):gsub("FlowNode_", "")
-        if short == "" then short = "?" end
-        if cls:find("Choice", 1, true) then
-            trailAdd(short, "!")
-            if recipe == nil then readRecipe(nd) end
-            return "choice"
-        end
-        local outs = Try(function()
-            local t = {}
-            for _, v in pairs(nd:GetConnectedNodes()) do
-                if type(v) == "userdata" then t[#t + 1] = v end
-            end
-            return t
-        end)
-        if type(outs) ~= "table" then trailAdd(short, "?outs"); return "more" end
-        if #outs == 0 then trailAdd(short, "."); return "end" end
-        trailAdd(short, string.format("(%d)", #outs))
-        local anyMore = false
-        for _, o in ipairs(outs) do
-            local r = visit(o, depth + 1)
-            if r == "choice" then return "choice" end
-            if r == "more" then anyMore = true end
-        end
-        if anyMore then return "more" end
-        return "end"
-    end
-    local ok, res = pcall(visit, rn, 0)
-    if not ok then
-        log("peek: !error => more")
-        return "more"
-    end
-    if res ~= "choice" and res ~= "end" then res = "more" end
-    if res == "end" then return res, table.concat(trail, ">"), recipe, recipeTimed end
-    if res == "choice" then return res, nil, recipe, recipeTimed end
-    return res
 end
 
 return P

@@ -1,6 +1,6 @@
 local conf = {}
 
-conf.VERSION = "1.0.0"
+conf.VERSION = "1.0.1"
 conf.TAG = string.format("[Dialogs++ %s]", conf.VERSION)
 
 conf.settings = {
