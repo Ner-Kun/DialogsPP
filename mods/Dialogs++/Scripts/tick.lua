@@ -25,16 +25,16 @@ local function tick()
     if not S.dialogueOver and not Usable(S.seenDialogue) and (tickCount % S.IDLE_EVERY_NTH) ~= 1 then
         return
     end
-    -- Over-watch: drop the anchor at dialogue end; reacquire reused widgets fresh.
-    -- Never poll dead pointers. New widgets arrive via NewObject.
+    -- Over-watch: drop the anchor at dialogue end and reacquire the reused widget
+    -- from the game's own manager pointer. The manager re-points when the next
+    -- dialogue starts; new widgets still arrive through NotifyOnNewObject.
     if S.dialogueOver then
-        if (tickCount % 4) ~= 1 then return end
-        local found = P.reacquireDialogue()
+        local found, src = P.reacquireDialogue()
         if found ~= nil then
             S.seenDialogue = found
             S.resetDialogue()
             S.dlgPath = Try(function() return found:GetFullName() end)
-            log("dialogue reopened")
+            log("dialogue reopened (%s)", src or "?")
             S.setState("APPEARED", "reopened")
             return
         end
@@ -91,7 +91,7 @@ local function tick()
         local hH = (gH ~= nil) and Try(function() return gH:GetHoveredButtonIndex() end) or nil
         log("choice hook: hover=%s", tostring(hH))
     end
-    -- Crash-tested widget probe: deactivation signals teardown/handover and graph rebuild. Freeze until reactivation
+    -- Widget deactivation signals teardown or handover and a graph rebuild; freeze until it reactivates.
     local actSig = nil
     do
         local dlgA = S.seenDialogue
@@ -119,7 +119,7 @@ local function tick()
             log("graph active")
         end
     end
-    -- Hard freeze: only the pause poll runs; the shell's children may be dead. All dialogue side work waits for thaw.
+    -- Hard freeze: only the pause poll runs. Child widgets may be dead; all dialogue side work waits for thaw.
     if S.graphFrozen then
         if S.pausePollInit == nil or (tickCount % 4) == 1 then P.readPauseMenu() end
         return
@@ -140,9 +140,11 @@ local function tick()
             log("activeflag: %s", iaSig)
         end
     end
-    -- Read-only skip-button probe: check immediately, then 1Hz.Fast skips can end dialogue in 1s; widget is perconversation.
+    -- Skip-button state is read-only: check immediately, then at 1 Hz. Fast skips can end a dialogue in about a second; the widget is per conversation.
     if S.skipBtnDone == nil or (tickCount % 4) == 1 then P.readSkipButton() end
-    -- Poll pause menu immediately, then 1Hz; menus change on human timescales.
+    -- UI link first: it feeds the native menu gate that readPauseMenu reads.
+    if S.uiMgr == nil or (tickCount % 4) == 1 then P.readUiManager() end
+    -- Poll the pause menu immediately, then at 1 Hz; menu state changes slowly.
     if S.pausePollInit == nil or (tickCount % 4) == 1 then P.readPauseMenu() end
 
     local pausedTick = S.escPauseArmed or S.menuOpen
@@ -269,7 +271,6 @@ local function tick()
 
         -- Anti-spam: leave the list untouched while clicks continue.
         -- After SPAM_CEIL_MS, resume arrow recovery to prevent permanent lockup.
-        -- It doesn't seem to be working, but I haven't come up with anything better yet. 
         local quietMs = (now - (S.lastFireClock or (now - 10))) * 1000
         local spamHeld = quietMs < S.QUIET_MS
             and (now - (S.state2Clock or now)) * 1000 <= S.SPAM_CEIL_MS

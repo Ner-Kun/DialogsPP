@@ -8,14 +8,14 @@ end
 
 local conf = require("conf")
 local S = require("state")
-local Try = require("util").Try
+local U = require("util")
+local Try = U.Try
 require("probes")
 local E = require("engine")
 local tick = require("tick")
 local H = require("hooks")
 require("input")
 
---  start
 E.loadNative()
 
 pcall(function()
@@ -24,6 +24,7 @@ pcall(function()
         S.tickCount = 0
         S.resetDialogue()
         S.dlgPath = Try(function() return obj:GetFullName() end)
+        U.rememberDialogue(obj)
         H.ensure()
         conf.log("dialogue appeared")
         S.setState("APPEARED", "new-object")

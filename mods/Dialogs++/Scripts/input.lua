@@ -12,14 +12,13 @@ local function onClick()
     --- Ignore clicks outside active dialogue; lingering widgets may remain Usable.
     if not Usable(S.seenDialogue) then return end
     if S.dialogueOver then return end
-    -- Frozen transition: avoid the graph during fades/teardown; clicks here crashed (0x630).
+    -- Frozen transition: avoid the graph during fades and teardown; clicks here have crashed the game.
     if S.graphFrozen then
         S.clickCount = S.clickCount + 1
         log("click #%d swallowed (frozen)", S.clickCount)
         return
     end
 
-    -- Log every physical press separately
     S.clickCount = S.clickCount + 1
     local mine = S.clickCount
     local tag = string.format("click #%d", mine)
@@ -28,7 +27,7 @@ local function onClick()
         log("%s swallowed (debounce)", tag)
         return
     end
-    -- Measure sincePrevMs before updating so it reflects the gap since the previous press.
+    -- Read the gap before overwriting the timestamp.
     local sincePrevMs = (now - S.lastFireClock) * 1000
     S.lastFireClock = now
 
@@ -201,8 +200,8 @@ if esc ~= nil then
                 -- Reset only dead anchors and parked resolve budgets.
                 if S.escPauseArmed then
                     if not Usable(S.pauseWidget) then
-                        S.pauseScanTries = nil
-                        S.pauseScanParked = nil
+                        S.pauseResolveTries = nil
+                        S.pauseResolveParked = nil
                         S.pauseResolved = nil
                     end
                 end

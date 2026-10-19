@@ -1,6 +1,6 @@
 local conf = {}
 
-conf.VERSION = "1.0.1"
+conf.VERSION = "1.0.2"
 conf.TAG = string.format("[Dialogs++ %s]", conf.VERSION)
 
 conf.settings = {
@@ -10,19 +10,18 @@ conf.settings = {
     TwoPress = false,
     -- Hide "space" prompt widget (visual only), once per dialogue.
     HidePrompt = false,
-    -- Enable repl wheel arrow navigation
+    -- Enable wheel navigation for reply lists
     WheelScroll = true,
     -- Keyboard navigation: W/S via DLL arrows
     KbNav = false,
     -- Reply confirm key (requires KbNav): 0 = E, 1 = F, 2 = both
     ConfirmKey = 0,
-    -- Timed choice duration in seconds, set before the game arms the timer. 0 =vanilla
+    -- Timed choice duration in seconds, set before the game arms the timer. 0 = vanilla
     TimerExtendSec = 30,
     DebounceMs = 90,
     Log = true,
 }
 
--- log
 conf.log = function(fmt, ...)
     if conf.settings.Log then
         print(conf.TAG .. " " .. string.format(fmt, ...) .. "\n")
@@ -103,5 +102,6 @@ conf.log("settings: skip=%s two-press=%s wheel=%s log=%s hide=%s kb=%s key=%s te
     tostring(conf.settings.HidePrompt), tostring(conf.settings.KbNav),
     keyNames[(conf.settings.ConfirmKey or 0) + 1] or "?",
     tostring(conf.settings.TimerExtendSec))
+
 
 return conf

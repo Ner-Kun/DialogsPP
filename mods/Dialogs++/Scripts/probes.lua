@@ -4,6 +4,7 @@ local U = require("util")
 local log = conf.log
 local Try, Usable, resolve = U.Try, U.Usable, U.resolve
 local P = {}
+local PAUSE_PATH = "/Game/_Dawnwalker/UI/_Unified/PauseMenu/WBP_PauseMenu.WBP_PauseMenu_C"
 
 P.readTimedChoice = function()
     local dlg = S.seenDialogue
@@ -20,36 +21,49 @@ P.readTimedChoice = function()
     return false
 end
 
---- Pause menu: stable instance after first open; visibility tracks open/close.
+--- Fallback pause-menu route while the UI subsystem is missing. The widget is
+--- stable after first open; visibility tracks open and close.
 local function isLivePauseInstance(o)
     if not Usable(o) then return false end
     local cn = Try(function() return o:GetClass():GetFName():ToString() end)
     return type(cn) == "string" and cn:find("PauseMenu", 1, true) ~= nil
 end
+
+local pauseCache = {}
+P.rememberPause = function(obj)
+    if not Usable(obj) then return end
+    for i = #pauseCache, 1, -1 do
+        local o = pauseCache[i]
+        if not Usable(o) then table.remove(pauseCache, i)
+        elseif o == obj then return end
+    end
+    pauseCache[#pauseCache + 1] = obj
+    -- A newly created pause widget can arrive after the resolver parked itself.
+    S.pauseResolved = nil
+    S.pauseResolveParked = nil
+    S.pauseResolveTries = 0
+    S.pauseWidget = nil
+    log("pausemenu: cached")
+end
 P.resolvePauseMenu = function()
     if S.pauseResolved ~= nil then return end
-    S.pauseScanTries = (S.pauseScanTries or 0) + 1
-    if S.pauseScanTries > 5 then
-        if not S.pauseScanParked then
-            S.pauseScanParked = true
-            log("pausemenu: scan failed, parking till next dialogue")
+    S.pauseResolveTries = (S.pauseResolveTries or 0) + 1
+    if S.pauseResolveTries > 5 then
+        if not S.pauseResolveParked then
+            S.pauseResolveParked = true
+            log("pausemenu: resolve failed, parking till next dialogue")
         end
         return
     end
     local found = nil
     local how = nil
-    if type(FindAllOf) == "function" then
-        local ok, res = pcall(FindAllOf, "WBP_PauseMenu_C")
-        if ok and res ~= nil then
-            pcall(function()
-                for _, o in pairs(res) do
-                    if isLivePauseInstance(o) then found = o break end
-                end
-            end)
-            res = nil
-            if found ~= nil then how = "findall" end
-        else
-            return -- transient miss
+    for i = #pauseCache, 1, -1 do
+        local o = pauseCache[i]
+        if not Usable(o) then
+            table.remove(pauseCache, i)
+        elseif isLivePauseInstance(o) then
+            found, how = o, "cache"
+            break
         end
     end
     if found == nil and type(FindObject) == "function" then
@@ -61,6 +75,7 @@ P.resolvePauseMenu = function()
             return
         end
     end
+    if found ~= nil then P.rememberPause(found) end
     S.pauseResolved = true
     if found ~= nil then
         S.pauseWidget = found
@@ -104,64 +119,75 @@ P.noteMenuClosed = function(label)
     end
 end
 
+--- Menu state: CanShowPauseMenu is the native gate; false means a modal menu
+--- is up. Before the UI subsystem resolves, the widget route answers. Any
+--- source saying OPEN wins; closing requires all sources quiet.
 P.readPauseMenu = function()
-    P.resolvePauseMenu()
-    local open = false
-    if Usable(S.pauseWidget) then
-        local vis = Try(function() return S.pauseWidget:GetVisibility() end)
-        -- IsVisible is the gate: GetVisibility sits at a constant on live
-        -- instances; a nil reading keeps the previous state (no flap).
-        local isv = Try(function() return S.pauseWidget:IsVisible() end)
-        -- the menu's own focus, logged as witness next to IsVisible
-        local mfocus = Try(function() return S.pauseWidget:HasFocusedDescendants() end)
-        if isv ~= nil then
-            open = (isv == true)
-            local sig = "vis=" .. tostring(vis) .. " isvis=" .. tostring(isv)
-                .. " mfocus=" .. tostring(mfocus)
-            if S.lastMenuSig ~= sig then
-                S.lastMenuSig = sig
-                log("pausemenu: %s", sig)
-            end
-        elseif vis ~= nil then
-            open = (vis == 0)
-        end
+    local can = nil
+    local visOpen = nil
+    if S.uiMgr ~= nil and Usable(S.uiMgr) then
+        can = Try(function() return S.uiMgr:CanShowPauseMenu() end)
     else
-        if S.pauseWidget ~= nil then
+        P.resolvePauseMenu()
+        if Usable(S.pauseWidget) then
+            local isv = Try(function() return S.pauseWidget:IsVisible() end)
+            if isv ~= nil then
+                visOpen = (isv == true)
+            else
+                local vis = Try(function() return S.pauseWidget:GetVisibility() end)
+                if vis ~= nil then visOpen = (vis == 0) end
+            end
+        elseif S.pauseWidget ~= nil then
             S.pauseWidget = nil
             S.pauseResolved = nil
             log("pausemenu: anchor died")
         end
     end
+    local open = false
+    if can == false then open = true end
+    if visOpen == true then open = true end
     if open ~= S.menuOpen then
         S.menuOpen = open
         S.escPauseArmed = false
+        local src = (can ~= nil) and "can" or "widget"
         if open then
-            P.noteMenuOpen("open")
+            P.noteMenuOpen("open (" .. src .. ")")
         else
-            P.noteMenuClosed("closed")
+            P.noteMenuClosed("closed (" .. src .. ")")
         end
     end
 end
 
---- After dialogue end, find a live widget with a valid ActiveDialogue.
+--- After dialogue end, reacquire the reused widget from the game's own pointer
+--- (UIManagerSubsystem.DialogueUIManager.ActiveDialogueWidget). It stays stale
+--- over the teardown window, so Usable gates it and a live ActiveDialogue is
+--- required; the manager re-points when the next dialogue starts. The Notify
+--- cache covers the manager's lag.
+local function liveWidget(aw)
+    if aw == nil or not Usable(aw) then return nil end
+    local cs = Try(function() return aw.CinematicSystem end)
+    local ad = (cs ~= nil and Usable(cs)) and Try(function() return cs.ActiveDialogue end) or nil
+    if ad ~= nil and Usable(ad) then return aw end
+    return nil
+end
+local function managerWidget()
+    if S.uiDum == nil or not Usable(S.uiDum) then return nil end
+    local aw = Try(function() return S.uiDum.ActiveDialogueWidget end)
+    return liveWidget(aw)
+end
+
 P.reacquireDialogue = function()
-    if type(FindAllOf) ~= "function" then return nil end
-    local ok, res = pcall(FindAllOf, "WBP_Dialogue_C")
-    if not ok or res == nil then return nil end
-    local found = nil
-    pcall(function()
-        for _, o in pairs(res) do
-            if Usable(o) then
-                local cs = Try(function() return o.CinematicSystem end)
-                if Usable(cs) then
-                    local ad = Try(function() return cs.ActiveDialogue end)
-                    if Usable(ad) then found = o break end
-                end
-            end
-        end
-    end)
-    res = nil
-    return found
+    local aw = managerWidget()
+    if aw ~= nil then
+        U.rememberDialogue(aw)
+        return aw, "manager"
+    end
+    local cached = U.findCachedDialogue(S.dlgPath)
+    if liveWidget(cached) ~= nil then
+        U.rememberDialogue(cached)
+        return cached, "cache"
+    end
+    return nil
 end
 
 --- Log Space-path flags from the fresh per-dialogue widget, never cache it.
@@ -247,7 +273,8 @@ end
 --- (section /Script/DialogueSystem.CinematicSettings - the value ini mods ship).
 --- Plain FindObject takes a class+name pair; full paths never hit (see
 --- util.refreshAnchor), so the Static paths go first. The property read
---- validates a hit; success caches, misses log once and retry on a throttle.
+--- validates a hit. A success is cached; a miss logs once and retries on a
+--- throttle.
 local function validateSettings(o)
     if o == nil then return nil end
     local v = Try(function() return o.DefaultTimedChoiceDuration end)
@@ -298,8 +325,8 @@ local function cineCdo()
 end
 
 --- Timed choice length: one property write on the settings CDO covers every
---- future arming on every build - no per-node lookups, no enumeration.
---- Nodes carrying bOverrideDefaultDuration keep their authored value.
+--- future arming on every build. Nodes carrying bOverrideDefaultDuration keep
+--- their authored value.
 P.applyTimedDefault = function()
     local sec = conf.settings.TimerExtendSec
     if type(sec) ~= "number" then return end
@@ -441,5 +468,27 @@ P.activeNodeClass = function()
     if short == "" then short = cls end
     return short
 end
+
+--- UI link: the game keeps its own pointers (widget.UIManager ->
+--- UIManagerSubsystem.DialogueUIManager -> ActiveDialogueWidget). Resolve once
+--- from the held dialogue widget; re-resolve when the subsystem dies. Feeds
+--- the native menu gate and the over-watch reacquire.
+P.readUiManager = function()
+    local dlg = S.seenDialogue
+    if not Usable(dlg) then return end
+    if S.uiMgr == nil or not Usable(S.uiMgr) then
+        S.uiMgr = Try(function() return dlg.UIManager end)
+        if S.uiMgr ~= nil and not Usable(S.uiMgr) then S.uiMgr = nil end
+        if S.uiMgr ~= nil then
+            S.uiDum = Try(function() return S.uiMgr.DialogueUIManager end)
+            if S.uiDum ~= nil and not Usable(S.uiDum) then S.uiDum = nil end
+        end
+    end
+end
+
+local okNotify = pcall(function()
+    NotifyOnNewObject(PAUSE_PATH, function(obj) P.rememberPause(obj) end)
+end)
+log("pausemenu: notify %s", okNotify and "on" or "off")
 
 return P
