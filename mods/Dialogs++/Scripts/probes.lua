@@ -453,6 +453,119 @@ P.readFirstUnlocked = function()
     return false
 end
 
+--- Diagnostic: one signature per displayed button. It follows the real button
+--- objects, not the node's Choices order, because pooled and replaced widgets
+--- can diverge. Logs only when the signature changes.
+local probeSig = nil
+
+P.resetChoiceProbe = function()
+    probeSig = nil
+end
+
+local function guidKey(g)
+    if g == nil then return "-" end
+    local a = Try(function() return g.A end)
+    local b = Try(function() return g.B end)
+    local c = Try(function() return g.C end)
+    local d = Try(function() return g.D end)
+    if type(a) == "number" and type(b) == "number"
+        and type(c) == "number" and type(d) == "number" then
+        return string.format("%d.%d.%d.%d", a, b, c, d)
+    end
+    return Try(function() return tostring(g) end) or "?"
+end
+
+local function classTag(o)
+    if not Usable(o) then return "-" end
+    return Try(function() return o:GetClass():GetFName():ToString() end) or "?"
+end
+
+local function val(v)
+    if v == nil then return "-" end
+    if type(v) == "boolean" then return v and "1" or "0" end
+    return tostring(v)
+end
+
+local function shortName(o)
+    if not Usable(o) then return "-" end
+    local s = Try(function() return o:GetName() end)
+    if type(s) ~= "string" or s == "" then
+        s = Try(function() return o:GetFullName() end)
+    end
+    if type(s) == "string" and s ~= "" then return s end
+    return "-"
+end
+
+P.readChoiceProbe = function()
+    local dlg = S.seenDialogue
+    if not Usable(dlg) then return end
+    local cw, g = resolve(dlg)
+    if g == nil then return end
+    local n = Try(function() return g:GetButtonCount() end)
+    if type(n) ~= "number" or n <= 0 or n > 16 then return end
+    local cn = Try(function() return dlg.DisplayedChoice end)
+    local arr = Usable(cn) and Try(function() return cn.Choices end) or nil
+    -- Hiding can happen at any layer: choice widget, container, label or icon.
+    local cwvis = cw ~= nil and Try(function() return cw:GetVisibility() end) or nil
+    local cwop = cw ~= nil and Try(function() return cw:GetRenderOpacity() end) or nil
+    local cont = cw ~= nil and Try(function() return cw.ChoiceContainer end) or nil
+    local contvis = Usable(cont) and Try(function() return cont:GetVisibility() end) or nil
+    local contop = Usable(cont) and Try(function() return cont:GetRenderOpacity() end) or nil
+    local full = Usable(cn) and Try(function() return cn.bIsFullscreenChoice end) or nil
+    local dialogue = shortName(Try(function() return dlg.DisplayedDialogue end))
+    local node = shortName(cn)
+    local parts = {}
+    for i = 0, n - 1 do
+        local b = Try(function() return g:GetButtonBaseAtIndex(i) end)
+        local ln = arr ~= nil and Try(function() return arr[i + 1] end) or nil
+        local lineGuid = ln ~= nil and Try(function() return ln.Guid end) or nil
+        -- ButtonGuid is the displayed line; arr[i + 1] is the node's choice.
+        -- They diverge when the game replaces a button.
+        local guid = Usable(b) and Try(function() return b.ButtonGuid end) or nil
+        if guid == nil then guid = lineGuid end
+        local av = "-"
+        local used = "-"
+        if Usable(cn) and guid ~= nil then
+            av = val(Try(function() return cn:GetAvailability(guid) end))
+            used = val(Try(function() return cn:IsChoiceUsed(guid) end))
+        end
+        local vis = Usable(b) and Try(function() return b:GetVisibility() end) or nil
+        local visb = Usable(b) and Try(function() return b:IsVisible() end) or nil
+        local en = Usable(b) and Try(function() return b:GetIsEnabled() end) or nil
+        if en == nil and Usable(b) then
+            en = Try(function() return b:IsEnabled() end)
+        end
+        local act = nil
+        if Usable(b) then
+            -- The property name can contain spaces; keep the plain fallback too.
+            act = Try(function() return b["Is Actively Replaced"] end)
+            if act == nil then act = Try(function() return b.IsActivelyReplaced end) end
+        end
+        local op = Usable(b) and Try(function() return b:GetRenderOpacity() end) or nil
+        local label = Usable(b) and Try(function() return b.ChoiceLabel end) or nil
+        local lop = Usable(label) and Try(function() return label:GetRenderOpacity() end) or nil
+        local lvis = Usable(label) and Try(function() return label:GetVisibility() end) or nil
+        local icon = Usable(b) and Try(function() return b.ChoiceIcon end) or nil
+        local iop = Usable(icon) and Try(function() return icon:GetRenderOpacity() end) or nil
+        local single = ln ~= nil and Try(function() return ln.bSingleUse end) or nil
+        local prog = ln ~= nil and Try(function() return ln.bProgressing end) or nil
+        local special = ln ~= nil and classTag(Try(function() return ln.SpecialChoice end)) or "-"
+        local cond = ln ~= nil and classTag(Try(function() return ln.Condition end)) or "-"
+        parts[#parts + 1] = string.format(
+            "%d:%s line=%s op=%s lop=%s lvis=%s iop=%s av=%s used=%s vis=%s visb=%s en=%s act=%s single=%s prog=%s special=%s cond=%s",
+            i, guidKey(guid), guidKey(lineGuid), val(op), val(lop), val(lvis), val(iop), av, used,
+            val(vis), val(visb), val(en), val(act), val(single), val(prog), special, cond)
+    end
+    local sig = string.format(
+        "dialogue=%q node=%q n=%s cwvis=%s cwop=%s contvis=%s contop=%s full=%s|%s",
+        dialogue, node, tostring(n), val(cwvis), val(cwop), val(contvis), val(contop),
+        val(full), table.concat(parts, "|"))
+    if sig ~= probeSig then
+        probeSig = sig
+        log("choice probe: %s", sig)
+    end
+end
+
 P.activeNodeClass = function()
     local dlg = S.seenDialogue
     if not Usable(dlg) then return nil end
@@ -490,5 +603,6 @@ local okNotify = pcall(function()
     NotifyOnNewObject(PAUSE_PATH, function(obj) P.rememberPause(obj) end)
 end)
 log("pausemenu: notify %s", okNotify and "on" or "off")
+log("choice probe: armed")
 
 return P

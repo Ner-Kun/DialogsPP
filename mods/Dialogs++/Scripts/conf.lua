@@ -1,6 +1,6 @@
 local conf = {}
 
-conf.VERSION = "1.0.2"
+conf.VERSION = "1.0.3"
 conf.TAG = string.format("[Dialogs++ %s]", conf.VERSION)
 
 conf.settings = {
@@ -29,14 +29,24 @@ conf.log = function(fmt, ...)
 end
 
 -- Reread config.ini every 2s and apply changes live. Unknown keys are ignored
+-- The debug source can come back as a non-string; a bad value must not break
+-- config rereads.
+local function findRoot()
+    local info = type(debug) == "table" and type(debug.getinfo) == "function"
+        and debug.getinfo(1, "S") or nil
+    local src = type(info) == "table" and info.source or nil
+    if type(src) ~= "string" then return nil end
+    local scripts = src:gsub("^@", ""):match("^(.*)[/\\][^/\\]*$")
+    return scripts and scripts:match("^(.*)[/\\][^/\\]*$") or nil
+end
+
+local root = findRoot()
+conf.root = root
 local lastConfigText = nil
 local configChecked = false
 local function readConfig()
     local log = conf.log
     local settings = conf.settings
-    local srcL = (debug.getinfo(1, "S").source or ""):gsub("^@", "")
-    local scrL = srcL:match("^(.*)[/\\][^/\\]*$")
-    local root = (scrL and scrL:match("^(.*)[/\\][^/\\]*$")) or nil
     if root == nil or type(io) ~= "table" or type(io.open) ~= "function" then
         if not configChecked then
             configChecked = true

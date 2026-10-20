@@ -7,12 +7,23 @@ local log = conf.log
 local settings = conf.settings
 local Try, Usable = U.Try, U.Usable
 local resolve, optionsShown, dialogueGone, flightSig = U.resolve, U.optionsShown, U.dialogueGone, U.flightSig
+local configReadError = false
 
+-- A failed config read must not escape the tick: it would disable the mod until
+-- the game restarts.
 local function tick()
     S.tickCount = S.tickCount + 1
     local tickCount = S.tickCount
     local now = os.clock()
-    if (tickCount % 8) == 1 then conf.readConfig() end
+    if (tickCount % 8) == 1 then
+        local ok, err = pcall(conf.readConfig)
+        if ok then
+            configReadError = false
+        elseif not configReadError then
+            configReadError = true
+            log("config: read failed (%s)", tostring(err))
+        end
+    end
     -- Timed choice length rides the settings CDO; apply on boot and on every
     -- live config change. The compare is pure Lua, the write one property op.
     if S.timedAppliedSec ~= settings.TimerExtendSec then P.applyTimedDefault() end
@@ -195,6 +206,7 @@ local function tick()
             S.refocusFails = 0
             S.refocusGaveUp = false
             S.focusProbeDone = false
+            P.resetChoiceProbe()
             if S.skipFlight ~= nil then
                 S.skipFlight = nil
                 S.lineSig = nil
@@ -202,6 +214,7 @@ local function tick()
             end
         end
         E.notify(S.MODE_OPTIONS, string.format("%d reply options visible (vis=%s)", n, tostring(vis)))
+        if settings.Log then P.readChoiceProbe() end
 
         if S.menuOpen then
             S.setState("PAUSED", "menu-over-list")
@@ -379,6 +392,7 @@ local function tick()
         S.timedWatchT0 = nil
         S.firstUnlocked = nil
         S.slotMapDone = nil
+        P.resetChoiceProbe()
         if S.lastHover ~= nil then S.lastHover = nil end
         -- Focus-back detects menu closure (ESC/Continue); uses the shared transition and clock freeze
         if S.menuOpen then
