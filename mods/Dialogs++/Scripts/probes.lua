@@ -21,6 +21,26 @@ P.readTimedChoice = function()
     return false
 end
 
+-- LOG-ONLY: what the game actually armed for this timed choice. A node with
+-- bOverrideDefaultDuration keeps its authored DurationOverride, so the global
+-- DefaultTimedChoiceDuration the mod writes never reaches it.
+P.timedInfo = function()
+    local dlg = S.seenDialogue
+    if not Usable(dlg) then return nil end
+    local cn = Try(function() return dlg.DisplayedChoice end)
+    if not Usable(cn) then return nil end
+    local td = Try(function() return cn.TimedChoiceData end)
+    local info = {}
+    info.node = Try(function() return cn:GetName() end)
+    info.total = Try(function() return cn.TimedChoiceDuration end)
+    if td ~= nil then
+        info.timed = Try(function() return td.bIsTimedChoice end)
+        info.override = Try(function() return td.bOverrideDefaultDuration end)
+        info.authored = Try(function() return td.DurationOverride end)
+    end
+    return info
+end
+
 --- Fallback pause-menu route while the UI subsystem is missing. The widget is
 --- stable after first open; visibility tracks open and close.
 local function isLivePauseInstance(o)
@@ -43,7 +63,7 @@ P.rememberPause = function(obj)
     S.pauseResolveParked = nil
     S.pauseResolveTries = 0
     S.pauseWidget = nil
-    log("pausemenu: cached")
+    log("pause: menu cached")
 end
 P.resolvePauseMenu = function()
     if S.pauseResolved ~= nil then return end
@@ -51,7 +71,7 @@ P.resolvePauseMenu = function()
     if S.pauseResolveTries > 5 then
         if not S.pauseResolveParked then
             S.pauseResolveParked = true
-            log("pausemenu: resolve failed, parking till next dialogue")
+            conf.warn("pause: menu resolve failed, retry next dialogue")
         end
         return
     end
@@ -84,10 +104,10 @@ P.resolvePauseMenu = function()
         local rsig = tostring(cn) .. "/" .. tostring(how)
         if rsig ~= S.lastResolveSig then
             S.lastResolveSig = rsig
-            log("pausemenu: resolved (name=%s cls=%s via %s)", tostring(nm), tostring(cn), tostring(how))
+            log("pause: menu resolved (%s/%s via %s)", tostring(nm), tostring(cn), tostring(how))
         end
     else
-        log("pausemenu: no live instance")
+        log("pause: no live instance")
     end
 end
 
@@ -102,7 +122,7 @@ P.thawPauseClocks = function(pausedFor)
 end
 P.noteMenuOpen = function(label)
     S.pauseOpenedAt = os.clock()
-    log("menu: %s", label)
+    log("pause: %s", label)
 end
 P.noteMenuClosed = function(label)
     local now = os.clock()
@@ -113,9 +133,9 @@ P.noteMenuClosed = function(label)
         P.thawPauseClocks(pausedFor)
     end
     if pausedFor >= 1 then
-        log("menu: %s (paused %ds)", label, math.floor(pausedFor))
+        log("pause: %s (paused %ds)", label, math.floor(pausedFor))
     else
-        log("menu: %s", label)
+        log("pause: %s", label)
     end
 end
 
@@ -140,7 +160,7 @@ P.readPauseMenu = function()
         elseif S.pauseWidget ~= nil then
             S.pauseWidget = nil
             S.pauseResolved = nil
-            log("pausemenu: anchor died")
+            conf.warn("pause: menu anchor died")
         end
     end
     local open = false
@@ -190,83 +210,23 @@ P.reacquireDialogue = function()
     return nil
 end
 
---- Log Space-path flags from the fresh per-dialogue widget, never cache it.
+--- Read the armed state from the fresh per-dialogue widget; never cache it.
 P.readSkipButton = function()
+    S.skipBtnDone = true
     local dlg = S.seenDialogue
-    if not Usable(dlg) then return end
+    if not Usable(dlg) then
+        S.promptVisible = nil
+        return
+    end
     local btn = Try(function() return dlg.SkipButtonWidget end)
     if not Usable(btn) then
         S.promptVisible = nil
-        if S.skipBtnDone == nil then
-            S.skipBtnDone = true
-            S.lastSkipBtnSig = "gone"
-            log("skipbtn: widget null/unreadable")
-        elseif S.lastSkipBtnSig ~= "gone" then
-            S.lastSkipBtnSig = "gone"
-            log("skipbtn chg: widget null/unreadable")
-        end
         return
     end
-    local hold = Try(function() return btn.bHoldSkipButtonAfterPressing end)
-    local anyIn = Try(function() return btn.bSkipOnAnyInput end)
-    local handle = Try(function() return btn.SkipInputAction end)
-    local rowName = nil
-    if handle ~= nil then
-        rowName = Try(function() return handle.RowName:ToString() end)
-        if type(rowName) ~= "string" then
-            rowName = Try(function() return tostring(handle.RowName) end)
-        end
-    end
-
-    local ea = Try(function() return btn.SkipEnhancedInputAction end)
-    local eaName = nil
-    if Usable(ea) then
-        eaName = Try(function() return ea:GetName() end)
-        if type(eaName) ~= "string" then
-            eaName = Try(function() return ea:GetFullName() end)
-        end
-    elseif type(ea) == "userdata" then
-        eaName = "null"
-    else
-        eaName = "missing"
-    end
-
-    local iaw = Try(function() return btn.InputActionWidget end)
-    local wdgName = nil
-    if Usable(iaw) then
-        local wea = Try(function() return iaw.EnhancedInputAction end)
-        if Usable(wea) then
-            wdgName = Try(function() return wea:GetName() end)
-            if type(wdgName) ~= "string" then
-                wdgName = Try(function() return wea:GetFullName() end)
-            end
-        elseif type(wea) == "userdata" then
-            wdgName = "null"
-        else
-            wdgName = "missing"
-        end
-    elseif type(iaw) == "userdata" then
-        wdgName = "nowidget-null"
-    else
-        wdgName = "nowidget-missing"
-    end
-
-    local en = Try(function() return btn:GetIsEnabled() end)
-    if en == nil then en = Try(function() return btn.bIsEnabled end) end
+    -- Only the armed state matters: two-press mode reads it, and the rest of
+    -- the widget is game-internal.
     local vis = Try(function() return btn:GetVisibility() end)
-
     if vis ~= nil then S.promptVisible = not (vis == 1 or vis == 2) end
-    local sig = string.format("hold=%s any=%s row=%s ea=%s wdg=%s en=%s vis=%s",
-        tostring(hold), tostring(anyIn), tostring(rowName),
-        tostring(eaName), tostring(wdgName), tostring(en), tostring(vis))
-    if S.skipBtnDone == nil then
-        S.skipBtnDone = true
-        S.lastSkipBtnSig = sig
-        log("skipbtn: %s", sig)
-    elseif sig ~= S.lastSkipBtnSig then
-        S.lastSkipBtnSig = sig
-        log("skipbtn chg: %s", sig)
-    end
 end
 
 --- The settings CDO holds the timed-choice length the game arms from
@@ -313,20 +273,20 @@ local function cineCdo()
         local hit = validateSettings(Try(c[2]))
         if hit ~= nil then
             P._cineCdo = hit
-            log("timed default: cdo resolved (via %s)", c[1])
+            log("timer: default source %s", c[1])
             return P._cineCdo
         end
     end
     if P._cineMissLogged ~= true then
         P._cineMissLogged = true
-        log("timed default: cdo not found (static+find tried)")
+        conf.warn("timer: settings CDO not found")
     end
     return nil
 end
 
---- Timed choice length: one property write on the settings CDO covers every
---- future arming on every build. Nodes carrying bOverrideDefaultDuration keep
---- their authored value.
+--- Timed choice length: one property write on the settings CDO covers nodes
+--- that use the default. Nodes with bOverrideDefaultDuration are rewritten by
+--- the choice-node watcher instead.
 P.applyTimedDefault = function()
     local sec = conf.settings.TimerExtendSec
     if type(sec) ~= "number" then return end
@@ -343,7 +303,7 @@ P.applyTimedDefault = function()
         P._writeRetryAt = clockNow + 2.0
         local ok = pcall(function() cdo.DefaultTimedChoiceDuration = want end)
         local now = ok and Try(function() return cdo.DefaultTimedChoiceDuration end) or nil
-        log("timed default: %s -> %s ok=%s now=%s", tostring(cur), tostring(want),
+        log("timer: default %s -> %s ok=%s now=%s", tostring(cur), tostring(want),
             tostring(ok), tostring(now))
         if ok and now == want then S.timedAppliedSec = sec end
         return
@@ -351,20 +311,104 @@ P.applyTimedDefault = function()
     S.timedAppliedSec = sec
     if S.timedDefaultLogged ~= want then
         S.timedDefaultLogged = want
-        log("timed default: dur=%s (in place)", tostring(want))
+        log("timer: default %s (in place)", tostring(want))
+    end
+end
+
+--- Called for every CinematicNode_Choice the game creates. Writing here lands
+--- before any timer can arm, and costs nothing per frame.
+P._written = setmetatable({}, { __mode = "k" })
+
+local function nodeLabel(nd)
+    local s = Try(function() return nd:GetFullName() end)
+    if type(s) == "string" then
+        return s:match("([^%.]+)$") or s
+    end
+    return "?"
+end
+
+P.prewriteNode = function(nd)
+    if not Usable(nd) then return end
+    local sec = conf.settings.TimerExtendSec
+    if type(sec) ~= "number" or sec <= 0 then return end
+    local td = Try(function() return nd.TimedChoiceData end)
+    if td == nil then return end
+    if Try(function() return td.bIsTimedChoice end) ~= true then return end
+    if P._written[nd] == nil then
+        P._written[nd] = {
+            over = Try(function() return td.bOverrideDefaultDuration end),
+            dur = Try(function() return td.DurationOverride end),
+        }
+    end
+    local okOver = pcall(function() td.bOverrideDefaultDuration = true end)
+    local okDur = pcall(function() td.DurationOverride = sec end)
+    log("timer: prewrite %s dur=%s->%s ok=%s", nodeLabel(nd),
+        tostring(P._written[nd].dur), tostring(sec),
+        tostring(okOver and okDur))
+end
+
+--- Watch choice-node creation instead of scanning the object array. Dialogue
+--- nodes are created when their asset loads, before the dialogue runs.
+P.watchChoiceNodes = function()
+    if P._choiceWatch == true then return end
+    P._choiceWatch = true
+    if type(NotifyOnNewObject) ~= "function" then
+        conf.warn("timer: NotifyOnNewObject missing, override timers left alone")
+        return
+    end
+    local ok, err = pcall(function()
+        NotifyOnNewObject("/Script/DialogueSystem.CinematicNode_Choice", function(obj)
+            P.prewriteNode(obj)
+        end)
+    end)
+    if not ok then
+        conf.warn("timer: choice watcher failed (%s)", tostring(err))
+        P._choiceWatch = false
+    else
+        log("timer: watching choice nodes")
+    end
+end
+
+--- Apply a live TimerExtendSec change to nodes already rewritten: new value,
+--- or their authored values for 0 (vanilla).
+P.syncTimed = function()
+    local sec = conf.settings.TimerExtendSec
+    if type(sec) ~= "number" then return end
+    local changed = 0
+    for nd, saved in pairs(P._written) do
+        if not Usable(nd) then
+            P._written[nd] = nil
+        else
+            local td = Try(function() return nd.TimedChoiceData end)
+            if td ~= nil then
+                if sec > 0 then
+                    pcall(function() td.bOverrideDefaultDuration = true end)
+                    pcall(function() td.DurationOverride = sec end)
+                else
+                    pcall(function() td.bOverrideDefaultDuration = saved.over end)
+                    pcall(function() td.DurationOverride = saved.dur end)
+                end
+                changed = changed + 1
+            end
+        end
+    end
+    if changed > 0 then
+        log("timer: sync %d nodes -> %s", changed, tostring(sec))
     end
 end
 
 
--- LOG-ONLY
+-- LOG-ONLY: fraction of the timer left plus the node's total length.
 P.readTimedRemaining = function()
     local dlg = S.seenDialogue
     if not Usable(dlg) then return nil end
     local cn = Try(function() return dlg.DisplayedChoice end)
     if not Usable(cn) then return nil end
     local r = Try(function() return cn:GetRemainingTimePercentage() end)
-    if type(r) == "number" then return r end
-    return nil
+    if type(r) ~= "number" then return nil end
+    local dur = Try(function() return cn.TimedChoiceDuration end)
+    if type(dur) ~= "number" then dur = nil end
+    return r, dur
 end
 
 P.readSlotMap = function()
@@ -372,17 +416,17 @@ P.readSlotMap = function()
     if not Usable(dlg) then return end
     local _, g = resolve(S.seenDialogue)
     if g == nil then
-        log("slots: no group")
+        log("choice: slots no group")
         return
     end
     local n = Try(function() return g:GetButtonCount() end)
     if type(n) ~= "number" or n <= 0 or n > 16 then
-        log("slots: count unreadable")
+        log("choice: slots count unreadable")
         return
     end
     local cn = Try(function() return dlg.DisplayedChoice end)
     if not Usable(cn) then
-        log("slots: node unreadable (n=%d)", n)
+        log("choice: slots node unreadable (n=%d)", n)
         return
     end
     local arr = Try(function() return cn.Choices end)
@@ -403,7 +447,7 @@ P.readSlotMap = function()
         end
         parts[#parts + 1] = string.format("%d:%s", i, st)
     end
-    log("slots: %s", table.concat(parts, " "))
+    log("choice: slots %s", table.concat(parts, " "))
 end
 
 P.readFirstUnlocked = function()
@@ -411,12 +455,12 @@ P.readFirstUnlocked = function()
     if not Usable(dlg) then return false end
     local cwU, gU = resolve(S.seenDialogue)
     if gU == nil then
-        log("firstunlocked: no group")
+        log("choice: first no group")
         return false
     end
     local first = Try(function() return cwU.FirstUnlockedChoiceWidget end)
     if not Usable(first) then
-        log("firstunlocked: field null/unreadable")
+        log("choice: first field null/unreadable")
         return false
     end
     local fname = Try(function() return first:GetFullName() end)
@@ -426,12 +470,12 @@ P.readFirstUnlocked = function()
         fhow = "name"
     end
     if type(fname) ~= "string" then
-        log("firstunlocked: name unreadable")
+        log("choice: first name unreadable")
         return false
     end
     local n = Try(function() return gU:GetButtonCount() end)
     if type(n) ~= "number" or n <= 0 or n > 16 then
-        log("firstunlocked: count unreadable")
+        log("choice: first count unreadable")
         return false
     end
     for i = 0, n - 1 do
@@ -444,127 +488,15 @@ P.readFirstUnlocked = function()
                 bn = Try(function() return b:GetName() end)
             end
             if bn == fname then
-                log("firstunlocked: index=%d (n=%d via %s)", i, n, fhow)
+                log("choice: first unlocked %d/%d (via %s)", i, n, fhow)
                 return true
             end
         end
     end
-    log("firstunlocked: no match (n=%d)", n)
+    log("choice: first no match (n=%d)", n)
     return false
 end
 
---- Diagnostic: one signature per displayed button. It follows the real button
---- objects, not the node's Choices order, because pooled and replaced widgets
---- can diverge. Logs only when the signature changes.
-local probeSig = nil
-
-P.resetChoiceProbe = function()
-    probeSig = nil
-end
-
-local function guidKey(g)
-    if g == nil then return "-" end
-    local a = Try(function() return g.A end)
-    local b = Try(function() return g.B end)
-    local c = Try(function() return g.C end)
-    local d = Try(function() return g.D end)
-    if type(a) == "number" and type(b) == "number"
-        and type(c) == "number" and type(d) == "number" then
-        return string.format("%d.%d.%d.%d", a, b, c, d)
-    end
-    return Try(function() return tostring(g) end) or "?"
-end
-
-local function classTag(o)
-    if not Usable(o) then return "-" end
-    return Try(function() return o:GetClass():GetFName():ToString() end) or "?"
-end
-
-local function val(v)
-    if v == nil then return "-" end
-    if type(v) == "boolean" then return v and "1" or "0" end
-    return tostring(v)
-end
-
-local function shortName(o)
-    if not Usable(o) then return "-" end
-    local s = Try(function() return o:GetName() end)
-    if type(s) ~= "string" or s == "" then
-        s = Try(function() return o:GetFullName() end)
-    end
-    if type(s) == "string" and s ~= "" then return s end
-    return "-"
-end
-
-P.readChoiceProbe = function()
-    local dlg = S.seenDialogue
-    if not Usable(dlg) then return end
-    local cw, g = resolve(dlg)
-    if g == nil then return end
-    local n = Try(function() return g:GetButtonCount() end)
-    if type(n) ~= "number" or n <= 0 or n > 16 then return end
-    local cn = Try(function() return dlg.DisplayedChoice end)
-    local arr = Usable(cn) and Try(function() return cn.Choices end) or nil
-    -- Hiding can happen at any layer: choice widget, container, label or icon.
-    local cwvis = cw ~= nil and Try(function() return cw:GetVisibility() end) or nil
-    local cwop = cw ~= nil and Try(function() return cw:GetRenderOpacity() end) or nil
-    local cont = cw ~= nil and Try(function() return cw.ChoiceContainer end) or nil
-    local contvis = Usable(cont) and Try(function() return cont:GetVisibility() end) or nil
-    local contop = Usable(cont) and Try(function() return cont:GetRenderOpacity() end) or nil
-    local full = Usable(cn) and Try(function() return cn.bIsFullscreenChoice end) or nil
-    local dialogue = shortName(Try(function() return dlg.DisplayedDialogue end))
-    local node = shortName(cn)
-    local parts = {}
-    for i = 0, n - 1 do
-        local b = Try(function() return g:GetButtonBaseAtIndex(i) end)
-        local ln = arr ~= nil and Try(function() return arr[i + 1] end) or nil
-        local lineGuid = ln ~= nil and Try(function() return ln.Guid end) or nil
-        -- ButtonGuid is the displayed line; arr[i + 1] is the node's choice.
-        -- They diverge when the game replaces a button.
-        local guid = Usable(b) and Try(function() return b.ButtonGuid end) or nil
-        if guid == nil then guid = lineGuid end
-        local av = "-"
-        local used = "-"
-        if Usable(cn) and guid ~= nil then
-            av = val(Try(function() return cn:GetAvailability(guid) end))
-            used = val(Try(function() return cn:IsChoiceUsed(guid) end))
-        end
-        local vis = Usable(b) and Try(function() return b:GetVisibility() end) or nil
-        local visb = Usable(b) and Try(function() return b:IsVisible() end) or nil
-        local en = Usable(b) and Try(function() return b:GetIsEnabled() end) or nil
-        if en == nil and Usable(b) then
-            en = Try(function() return b:IsEnabled() end)
-        end
-        local act = nil
-        if Usable(b) then
-            -- The property name can contain spaces; keep the plain fallback too.
-            act = Try(function() return b["Is Actively Replaced"] end)
-            if act == nil then act = Try(function() return b.IsActivelyReplaced end) end
-        end
-        local op = Usable(b) and Try(function() return b:GetRenderOpacity() end) or nil
-        local label = Usable(b) and Try(function() return b.ChoiceLabel end) or nil
-        local lop = Usable(label) and Try(function() return label:GetRenderOpacity() end) or nil
-        local lvis = Usable(label) and Try(function() return label:GetVisibility() end) or nil
-        local icon = Usable(b) and Try(function() return b.ChoiceIcon end) or nil
-        local iop = Usable(icon) and Try(function() return icon:GetRenderOpacity() end) or nil
-        local single = ln ~= nil and Try(function() return ln.bSingleUse end) or nil
-        local prog = ln ~= nil and Try(function() return ln.bProgressing end) or nil
-        local special = ln ~= nil and classTag(Try(function() return ln.SpecialChoice end)) or "-"
-        local cond = ln ~= nil and classTag(Try(function() return ln.Condition end)) or "-"
-        parts[#parts + 1] = string.format(
-            "%d:%s line=%s op=%s lop=%s lvis=%s iop=%s av=%s used=%s vis=%s visb=%s en=%s act=%s single=%s prog=%s special=%s cond=%s",
-            i, guidKey(guid), guidKey(lineGuid), val(op), val(lop), val(lvis), val(iop), av, used,
-            val(vis), val(visb), val(en), val(act), val(single), val(prog), special, cond)
-    end
-    local sig = string.format(
-        "dialogue=%q node=%q n=%s cwvis=%s cwop=%s contvis=%s contop=%s full=%s|%s",
-        dialogue, node, tostring(n), val(cwvis), val(cwop), val(contvis), val(contop),
-        val(full), table.concat(parts, "|"))
-    if sig ~= probeSig then
-        probeSig = sig
-        log("choice probe: %s", sig)
-    end
-end
 
 P.activeNodeClass = function()
     local dlg = S.seenDialogue
@@ -602,7 +534,6 @@ end
 local okNotify = pcall(function()
     NotifyOnNewObject(PAUSE_PATH, function(obj) P.rememberPause(obj) end)
 end)
-log("pausemenu: notify %s", okNotify and "on" or "off")
-log("choice probe: armed")
+if not okNotify then conf.warn("pause widget: notify unavailable") end
 
 return P

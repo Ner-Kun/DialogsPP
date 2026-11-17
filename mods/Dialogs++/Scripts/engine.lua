@@ -14,19 +14,19 @@ E.native = nil  -- dialogs_mode_0/1/2 + prime/down arrows, or nil
 E.loadNative = function()
     local root = U.modFolder()
     if root == nil then
-        log("cannot locate the mod folder, wheel disabled")
+        conf.warn("dll: mod folder not found, wheel disabled")
         return
     end
 
     local dll = root .. "\\bin\\dialogs++.dll"
     if type(package) ~= "table" or type(package.loadlib) ~= "function" then
-        log("package.loadlib missing, wheel disabled")
+        conf.warn("dll: package.loadlib missing, wheel disabled")
         return
     end
     local function load(name)
         local ok, fn = pcall(package.loadlib, dll, name)
         if ok and type(fn) == "function" then return fn end
-        log("export %s not found (%s), wheel disabled", name, dll)
+        conf.warn("dll: export %s in %s, wheel disabled", name, dll)
         return nil
     end
     local m0, m1, m2 = load("dialogs_mode_0"), load("dialogs_mode_1"), load("dialogs_mode_2")
@@ -36,20 +36,20 @@ E.loadNative = function()
         if mP ~= nil then
             E.native.prime = mP
         else
-            log("export dialogs_prime_arrow not found, arrow prime off")
+            log("dll: export dialogs_prime_arrow missing, arrow prime off")
         end
         -- Keyboard navigation (W/S)
         local mD = load("dialogs_arrow_down")
         if mD ~= nil then
             E.native.down = mD
         else
-            log("export dialogs_arrow_down not found, S key off")
+            log("dll: export dialogs_arrow_down missing, S key off")
         end
-        log("native bridge ready (%s)", dll)
+        log("dll: ready (%s)", dll)
     end
 end
 
---- Send dialogue state directly to the DLL. Log pcall
+--- Send dialogue state to the DLL and log the call result.
 E.notify = function(mode, label)
     if mode == S.lastMode then return end
     S.lastMode = mode
@@ -62,10 +62,10 @@ E.notify = function(mode, label)
     end
     if E.native ~= nil then
         local ok, err = pcall(E.native[dllMode])
-        log("dll mode -> %d (%s) native_call=%s%s %s", mode, label, tostring(ok),
+        log("dll: mode=%d (%s) call=%s%s %s", mode, label, tostring(ok),
             suffix, ok and "" or tostring(err))
     else
-        log("dll mode -> %d (%s) NATIVE MISSING", mode, label)
+        conf.warn("dll: mode=%d (%s) native bridge missing", mode, label)
     end
 end
 
@@ -79,9 +79,14 @@ end
 
 E.skipOne = function(dlg)
     -- Use the game's skip entry to preserve its permission checks. Avoid the deeper route.
-    -- 1 press Space blocks the native double press upstream.
-    if Usable(dlg) and pcall(function() dlg:HandleSkipActionNative() end) then
-        return "skipped-action"
+    if Usable(dlg) then
+        local previous = S.inModSkip
+        S.inModSkip = true
+        local ok = pcall(function() dlg:HandleSkipActionNative() end)
+        S.inModSkip = previous
+        if ok then
+            return "skipped-action"
+        end
     end
     return "action-failed"
 end
@@ -110,13 +115,13 @@ E.twoPress = function(tag)
     if not Usable(btn) then return false end
     -- restore the prompt's natural shown state (vis=4 on live dialogues).
     local ok, err = pcall(function() btn:SetVisibility(4) end)
-    log("%s shows prompt ok=%s %s", tag, tostring(ok), ok and "" or tostring(err))
+    log("two-press: prompt shown ok=%s %s", tag, tostring(ok), ok and "" or tostring(err))
     if ok then S.promptVisible = true end
     return true
 end
 
 --- Shared click/Space skip tail: gates, one native call, and in-flight tracking.
---- Returns a log-ready string; caller adds the press tag. Tick owns lineSig; no engine reads beyond skipOne
+--- Returns a log-ready string; caller adds the press tag. Tick owns lineSig; engine reads stay in this function and skipOne.
 E.doSkip = function(tag)
     -- Block skips after dialogue ends while delayed end detection catches up
     if S.dialogueOver or S.endStrikes > 0 then
@@ -137,22 +142,41 @@ E.doSkip = function(tag)
     if not S.started then
         return string.format("%s swallowed (not started)", tag)
     end
+    -- No live response node means the graph is between lines or in teardown.
+    -- A skip here is exactly the "advance into a rebuilding graph" crash.
+    if S.lineSig == nil or S.lineSig == "no-response" then
+        return string.format("%s swallowed (no line)", tag)
+    end
     if S.skipFlight ~= nil then
         return string.format("%s swallowed (in flight)", tag)
     end
     local dlg = S.seenDialogue
     local how = "no-dialogue"
     if Usable(dlg) then
+        -- The widget clears its own dialogue pointer before the subsystem drops
+        -- the active one. Calling the skip entry in that window dereferences a
+        -- null dialogue, so a click or press there is dropped.
+        local shownDlg = Try(function() return dlg.DisplayedDialogue end)
+        if shownDlg == nil or not Usable(shownDlg) then
+            return string.format("%s swallowed (dialogue closing)", tag)
+        end
+        local csNow = Try(function() return dlg.CinematicSystem end)
+        if Usable(csNow) then
+            local activeNow = Try(function() return csNow.ActiveDialogue end)
+            if activeNow == nil or not Usable(activeNow) then
+                return string.format("%s swallowed (dialogue closing)", tag)
+            end
+        end
         how = E.skipOne(dlg)
         if how == "skipped-action" then
-            -- copy the tick's running signature; never read the engine here
-            -- because engine calls in click context crashed the game.
+            -- Copy the tick's running signature instead of reading the engine
+            -- again on the press path.
             local now = os.clock()
             local base = nil
             if S.lineSig ~= nil and (now - (S.lineSigT or 0)) <= 0.5 then base = S.lineSig end
             S.skipFlight = { t = now, sig = base }
             if base == nil then
-                log("flight blind (short gate)")
+                log("flight: blind (short gate)")
             end
         end
     end

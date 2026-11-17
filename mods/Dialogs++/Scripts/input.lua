@@ -1,6 +1,7 @@
 local conf = require("conf")
 local S = require("state")
 local U = require("util")
+local Sch = require("sched")
 local E = require("engine")
 local P = require("probes")
 local log = conf.log
@@ -8,14 +9,24 @@ local settings = conf.settings
 local Try, Usable = U.Try, U.Usable
 local optionsShown = U.optionsShown
 
+-- Key callbacks fire off the game thread. The delayed form is the one that
+-- stays safe in this UE4SS build.
+local function dispatch(fn)
+    if type(ExecuteInGameThreadWithDelay) == "function" then
+        ExecuteInGameThreadWithDelay(0, fn)
+    else
+        ExecuteInGameThread(fn)
+    end
+end
+
 local function onClick()
     --- Ignore clicks outside active dialogue; lingering widgets may remain Usable.
     if not Usable(S.seenDialogue) then return end
     if S.dialogueOver then return end
-    -- Frozen transition: avoid the graph during fades and teardown; clicks here have crashed the game.
+    -- Frozen transition: never touch the graph during fades and teardown.
     if S.graphFrozen then
         S.clickCount = S.clickCount + 1
-        log("click #%d swallowed (frozen)", S.clickCount)
+        log("skip: click #%d blocked (frozen)", S.clickCount)
         return
     end
 
@@ -24,7 +35,7 @@ local function onClick()
     local tag = string.format("click #%d", mine)
     local now = U.passDebounce(S.lastFireClock, settings.DebounceMs)
     if now == nil then
-        log("%s swallowed (debounce)", tag)
+        log("skip: %s blocked (debounce)", tag)
         return
     end
     -- Read the gap before overwriting the timestamp.
@@ -33,38 +44,163 @@ local function onClick()
 
     local shown = optionsShown()
     if shown then
-        log("%s", E.doConfirm(tag, "click", now, sincePrevMs))
+        log("choice: %s", E.doConfirm(tag, "click", now, sincePrevMs))
         return
     end
 
     -- Skip path: engine.doSkip enforces in-flight, dialogue, menu, and first-line gates.
     if not E.lmbOn() then return end
     if E.twoPress(tag) then return end
-    log("%s", E.doSkip(tag))
+    log("skip: %s", E.doSkip(tag))
 end
 
 -- Space skip: use click skip gates off-list; keep Space native on choice lists.
 -- Two-press mode stays native; the bind never consumes Space.
+local finishSpaceSkip
+
+-- Queue the call on the game thread. Zero delay means the next frame, not a
+-- second press: the press already happened, this only moves the call into the
+-- engine's thread so the action is safe to invoke.
+local function scheduleSpace(pending, delayMs)
+    Sch.later(delayMs or 0, function() finishSpaceSkip(pending) end)
+end
+
+finishSpaceSkip = function(pending)
+    if S.pendingSpace ~= pending then return end
+    S.pendingSpace = nil
+    local spanMs = (os.clock() - pending.at) * 1000
+    if spanMs > 80 and not pending.waited then
+        log("skip: %s late (+%.0fms)", pending.tag, spanMs)
+    end
+
+    if settings.TwoPress or not E.spaceOn() then
+        log("skip: %s blocked (mode)", pending.tag)
+        return
+    end
+    if S.dialogueOver or S.endStrikes > 0 then
+        log("skip: %s blocked (dialogue over)", pending.tag)
+        return
+    end
+    if S.escPauseArmed or S.menuOpen then
+        log("skip: %s blocked (pause)", pending.tag)
+        return
+    end
+    if S.graphFrozen then
+        log("skip: %s blocked (frozen)", pending.tag)
+        return
+    end
+    if not S.started then
+        log("skip: %s blocked (not started)", pending.tag)
+        return
+    end
+    if S.seenDialogue ~= pending.dlg then
+        log("skip: %s blocked (new dialogue)", pending.tag)
+        return
+    end
+    -- The widget clears its own dialogue pointer before the subsystem drops
+    -- the active one. Calling the skip entry in that window dereferences a
+    -- null dialogue, so a press there is dropped.
+    local shownDlg = Try(function() return pending.dlg.DisplayedDialogue end)
+    if shownDlg == nil or not Usable(shownDlg) then
+        log("skip: %s blocked (no displayed dialogue)", pending.tag)
+        return
+    end
+    local csNow = Try(function() return pending.dlg.CinematicSystem end)
+    if Usable(csNow) then
+        local activeNow = Try(function() return csNow.ActiveDialogue end)
+        if activeNow == nil or not Usable(activeNow) then
+            log("skip: %s blocked (no active dialogue)", pending.tag)
+            return
+        end
+    end
+    if optionsShown() or S.lastMode == S.MODE_OPTIONS then
+        log("skip: %s blocked (list)", pending.tag)
+        return
+    end
+    if S.skipFlight ~= nil then
+        -- The tick refreshes lineSig at 250 ms, so the gate can be up to that
+        -- stale. A fresh read decides whether the previous skip already landed;
+        -- if it did, continue. If not, hold the press and retry instead of
+        -- dropping it: the user pressed, the skip should happen when it can.
+        local sigNow, guidNow = U.flightSig()
+        local moved = sigNow ~= nil and sigNow ~= "no-response"
+            and S.skipFlight.sig ~= nil and sigNow ~= S.skipFlight.sig
+        if moved then
+            log("skip: %s flight released (fresh)", pending.tag)
+            S.skipFlight = nil
+            S.lineSig = sigNow
+            if guidNow ~= nil then S.lineGuid = guidNow end
+        else
+            local waitedMs = (os.clock() - pending.at) * 1000
+            if waitedMs < S.SPACE_RETRY_MS then
+                S.pendingSpace = pending
+                if not pending.waited then
+                    pending.waited = true
+                    log("skip: %s waiting (in flight)", pending.tag)
+                end
+                scheduleSpace(pending, S.SPACE_RETRY_STEP)
+                return
+            end
+            log("skip: %s blocked (in flight, %.0fms)", pending.tag, waitedMs)
+            return
+        end
+    end
+    if (S.lastNativeSkipAt or 0) >= pending.at then
+        log("skip: %s native (hook moved)", pending.tag)
+        return
+    end
+    if S.skipHookReady then
+        log("skip: %s", E.doSkip(pending.tag))
+        return
+    end
+    if pending.sig == nil or pending.guid == nil then
+        log("skip: %s blocked (no baseline)", pending.tag)
+        return
+    end
+    if S.lineGuid == nil or S.lineGuid == "no-response" then
+        log("skip: %s blocked (no line)", pending.tag)
+        return
+    end
+    if S.lineGuid ~= pending.guid then
+        log("skip: %s native (node moved)", pending.tag)
+        return
+    end
+    if S.lineSig == nil or S.lineSig == "no-response" then
+        log("skip: %s blocked (no signature)", pending.tag)
+        return
+    end
+    if S.lineSig ~= pending.sig then
+        log("skip: %s voice moved (same node)", pending.tag)
+    end
+
+    log("skip: %s", E.doSkip(pending.tag))
+end
+
 local function onSpace()
     if not Usable(S.seenDialogue) then return end
     if S.dialogueOver then return end
     if S.graphFrozen then
         S.spaceCount = S.spaceCount + 1
-        log("space #%d swallowed (frozen)", S.spaceCount)
+        log("skip: space #%d blocked (frozen)", S.spaceCount)
         return
     end
     local shownS = optionsShown()
     if shownS then
-        log("space")
+        log("space: native (list)")
         return
     end
     if not E.spaceOn() then
-        log("space")
+        log("space: native (skip off)")
         return
     end
     if settings.TwoPress then
         -- Native two-step: the game shows the prompt, then skips on the second press.
-        log("space")
+        log("space: native (two-press)")
+        return
+    end
+    if S.pendingSpace ~= nil then
+        S.spaceCount = S.spaceCount + 1
+        log("skip: space #%d blocked (pending)", S.spaceCount)
         return
     end
     S.spaceCount = S.spaceCount + 1
@@ -72,11 +208,29 @@ local function onSpace()
     local tag = string.format("space #%d", mine)
     local now = U.passDebounce(S.lastSpaceClock, settings.DebounceMs)
     if now == nil then
-        log("%s swallowed (debounce)", tag)
+        log("skip: %s blocked (debounce)", tag)
         return
     end
     S.lastSpaceClock = now
-    log("%s", E.doSkip(tag))
+    if (now - (S.lastNativeSkipAt or 0)) < 0.25 then
+        log("skip: %s native (already)", tag)
+        return
+    end
+
+    -- The game's own handler runs first for the same press; by the time we get
+    -- here, a native skip is already recorded. Only call the entry when it is
+    -- not, and hop to the game thread for the call. Zero delay means the next
+    -- tick, not a second press: the gate above already covers the native path.
+    local pending = {
+        tag = tag,
+        at = now,
+        sig = S.lineSig,
+        guid = S.lineGuid,
+        dlg = S.seenDialogue,
+    }
+    S.pendingSpace = pending
+    log("skip: %s press (line=%s)", tag, conf.shortId(S.lineSig))
+    scheduleSpace(pending, S.SPACE_DEFER_MS)
 end
 
 -- W/S navigate via DLL arrows; confirm uses the click gates.
@@ -106,23 +260,23 @@ local function onNavKey(dir)
     if not shownN then return end
     if S.lastMode ~= S.MODE_OPTIONS then return end
     if E.native == nil then
-        log("key %s: native missing", dir)
+        log("nav %s: native bridge missing", dir)
         return
     end
     if dir == "W" then
         if E.native.prime == nil then
-            log("key W: arrow up missing")
+            log("nav W: arrow up missing")
             return
         end
         local okU, errU = pcall(E.native.prime)
-        log("key W -> up ok=%s %s", tostring(okU), okU and "" or tostring(errU))
+        log("nav W: up ok=%s %s", tostring(okU), okU and "" or tostring(errU))
     else
         if E.native.down == nil then
-            log("key S: arrow down missing (old DLL?)")
+            log("nav S: arrow down missing (old DLL?)")
             return
         end
         local okD, errD = pcall(E.native.down)
-        log("key S -> down ok=%s %s", tostring(okD), okD and "" or tostring(errD))
+        log("nav S: down ok=%s %s", tostring(okD), okD and "" or tostring(errD))
     end
 end
 
@@ -134,12 +288,12 @@ local function onConfirmKey(which)
     if not Usable(S.seenDialogue) then return end
     if S.dialogueOver then return end
     if S.graphFrozen then
-        log("key %s swallowed (frozen)", which)
+        log("choice: key %s blocked (frozen)", which)
         return
     end
     local now = U.passDebounce(S.lastKeyClock, settings.DebounceMs)
     if now == nil then
-        log("key %s swallowed (debounce)", which)
+        log("choice: key %s blocked (debounce)", which)
         return
     end
     S.lastKeyClock = now
@@ -149,21 +303,21 @@ local function onConfirmKey(which)
     S.lastFireClock = now
     local shown = optionsShown()
     if not shown then return end
-    log("%s", E.doConfirm(string.format("key %s", which), "key", now, sincePrevMs))
+    log("choice: %s", E.doConfirm(string.format("key %s", which), "key", now, sincePrevMs))
 end
 
 local function bindNavKey(name, fn, label)
     local k = findKey(name)
     if k == nil then
-        log("%s not available in this UE4SS build", label)
+        conf.warn("bind %s: key missing in this UE4SS build", label)
         return
     end
     local ok, err = pcall(function()
         RegisterKeyBind(k, function()
-            ExecuteInGameThread(fn)
+            dispatch(fn)
         end)
     end)
-    if not ok then log("could not bind %s: %s", label, tostring(err)) end
+    if not ok then conf.warn("bind %s: %s", label, tostring(err)) end
 end
 bindNavKey("W", function() onNavKey("W") end, "W")
 bindNavKey("S", function() onNavKey("S") end, "S")
@@ -174,12 +328,12 @@ local lmb = Try(function() return Key.LEFT_MOUSE_BUTTON end)
 if lmb ~= nil then
     local ok, err = pcall(function()
         RegisterKeyBind(lmb, function()
-            ExecuteInGameThread(onClick)
+            dispatch(onClick)
         end)
     end)
-    if not ok then log("could not bind LMB: %s", tostring(err)) end
+    if not ok then conf.warn("bind LMB: %s", tostring(err)) end
 else
-    log("LMB key not available in this UE4SS build")
+    conf.warn("bind LMB: key missing in this UE4SS build")
 end
 
 -- ESC arms pause detection until the menu poll confirms it; disarm on disable,
@@ -208,7 +362,7 @@ if esc ~= nil then
             else
                 S.escPauseArmed = false
             end
-            log("KEY ESC")
+            log("pause: esc (armed=%s)", tostring(S.escPauseArmed))
         end)
     end)
 end
@@ -220,10 +374,9 @@ local function bindWheel(name, keyObj, counter)
         RegisterKeyBind(keyObj, function()
             if not Usable(S.seenDialogue) then return end
             counter[1] = counter[1] + 1
-            log("wheel %s #%d", name, counter[1])
         end)
     end)
-    log("wheel bind %s: %s", name, ok and "ok" or tostring(err))
+    if not ok then conf.warn("bind wheel %s: %s", name, tostring(err)) end
 end
 do
     local all, ups, downs = {}, {}, {}
@@ -245,13 +398,13 @@ do
         end)
     end
     table.sort(all)
-    log("Key type=%s wheel/scroll entries (%d): %s",
+    log("wheel: keys type=%s entries (%d): %s",
         type(Key), #all, table.concat(all, ", "))
     local upCount, downCount = { 0 }, { 0 }
     for _, e in ipairs(ups) do bindWheel("up:" .. e[1], e[2], upCount) end
     for _, e in ipairs(downs) do bindWheel("down:" .. e[1], e[2], downCount) end
     if #ups == 0 and #downs == 0 then
-        log("wheel keys not available in this UE4SS build")
+        conf.warn("bind wheel: no wheel keys in this UE4SS build")
     end
 end
 
@@ -260,11 +413,11 @@ local spc = Try(function() return Key.SPACE end)
 if spc ~= nil then
     pcall(function()
         RegisterKeyBind(spc, function()
-            ExecuteInGameThread(onSpace)
+            dispatch(onSpace)
         end)
     end)
 else
-    log("space key not available in this UE4SS build")
+    conf.warn("bind space: key missing in this UE4SS build")
 end
 
 return true

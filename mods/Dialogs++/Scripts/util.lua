@@ -101,9 +101,13 @@ U.refreshAnchor = function()
     -- no lookup ran, or the cache is empty and FindObject is unavailable: keep the anchor
     if src == nil then return end
     if src == "miss" then
-        log("anchor: miss")
-    else
-        log("anchor: %s %s", src, anchorTag(found))
+        if S.lastAnchorSrc ~= "miss" then
+            S.lastAnchorSrc = "miss"
+            log("dialogue: anchor miss")
+        end
+    elseif S.lastAnchorSrc ~= src then
+        S.lastAnchorSrc = src
+        log("dialogue: anchor %s (%s)", src, anchorTag(found))
     end
     if found ~= nil or src == "miss" then
         S.seenDialogue = found
@@ -144,10 +148,29 @@ end
 U.dialogueGone = function()
     local dlg = S.seenDialogue
     if not Usable(dlg) then return true end
+    -- The widget drops its own pointer first; the subsystem follows.
+    local shown = Try(function() return dlg.DisplayedDialogue end)
+    if shown == nil or not Usable(shown) then return true end
     local cs = Try(function() return dlg.CinematicSystem end)
     if not Usable(cs) then return true end
     local ad = Try(function() return cs.ActiveDialogue end)
     return not Usable(ad)
+end
+
+--- Format an FGuid from its int32 fields. `tostring(FGuid)` in this UE4SS
+--- build returns the struct wrapper address, not the GUID value, so using it
+--- as a progress signature makes the line look changed on every read.
+local function guidText(guid)
+    if guid == nil then return nil end
+    local a = Try(function() return guid.A end)
+    local b = Try(function() return guid.B end)
+    local c = Try(function() return guid.C end)
+    local d = Try(function() return guid.D end)
+    if type(a) == "number" and type(b) == "number"
+        and type(c) == "number" and type(d) == "number" then
+        return string.format("%d.%d.%d.%d", a, b, c, d)
+    end
+    return nil
 end
 
 --- Progress signature of the current line: active response node + voice
@@ -165,9 +188,14 @@ U.flightSig = function()
     if not Usable(ad) then return nil end
     local rn = Try(function() return ad:GetActiveResponseNode() end)
     if not Usable(rn) then return "no-response", "no-response" end
-    local guid = Try(function() return tostring(rn.NodeGuid) end)
-    local sec = Try(function() return tostring(rn.CurrentVoiceSection) end)
-    if guid == nil or sec == nil then return nil end
+    -- FGuid fields first; the object name is a stable fallback if this build
+    -- does not expose struct members.
+    local guid = guidText(Try(function() return rn.NodeGuid end))
+    if guid == nil then
+        guid = Try(function() return rn:GetFullName() end)
+    end
+    if guid == nil then return nil end
+    local sec = guidText(Try(function() return rn.CurrentVoiceSection end)) or guid
     return guid .. "|" .. sec, guid
 end
 

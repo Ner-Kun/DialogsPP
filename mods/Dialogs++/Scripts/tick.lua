@@ -9,6 +9,15 @@ local Try, Usable = U.Try, U.Usable
 local resolve, optionsShown, dialogueGone, flightSig = U.resolve, U.optionsShown, U.dialogueGone, U.flightSig
 local configReadError = false
 
+-- Timed choice progress for the log: seconds left out of the total when the
+-- node exposes it, percent otherwise.
+local function timerLeft(rem, dur)
+    if type(dur) == "number" and dur > 0 then
+        return string.format("%.1fs/%.0fs", rem * dur, dur)
+    end
+    return string.format("%.0f%%", rem * 100)
+end
+
 -- A failed config read must not escape the tick: it would disable the mod until
 -- the game restarts.
 local function tick()
@@ -21,16 +30,19 @@ local function tick()
             configReadError = false
         elseif not configReadError then
             configReadError = true
-            log("config: read failed (%s)", tostring(err))
+            conf.warn("config: read failed (%s)", tostring(err))
         end
     end
     -- Timed choice length rides the settings CDO; apply on boot and on every
     -- live config change. The compare is pure Lua, the write one property op.
-    if S.timedAppliedSec ~= settings.TimerExtendSec then P.applyTimedDefault() end
+    if S.timedAppliedSec ~= settings.TimerExtendSec then
+        P.applyTimedDefault()
+        P.syncTimed()
+    end
     if S.graphFrozen and S.freezeAt ~= nil and (now - S.freezeAt) > S.FREEZE_CEIL then
         S.graphFrozen = false
         S.freezeAt = nil
-        log("graph thawed (ceiling)")
+        log("graph: thawed (ceiling)")
     end
     
     if not S.dialogueOver and not Usable(S.seenDialogue) and (tickCount % S.IDLE_EVERY_NTH) ~= 1 then
@@ -45,7 +57,7 @@ local function tick()
             S.seenDialogue = found
             S.resetDialogue()
             S.dlgPath = Try(function() return found:GetFullName() end)
-            log("dialogue reopened (%s)", src or "?")
+                log("dialogue: reopen (%s)", src or "?")
             S.setState("APPEARED", "reopened")
             return
         end
@@ -59,7 +71,7 @@ local function tick()
         S.freezeAt = nil
         -- Log dialogue end duration separately; the state line scrolls away.
         if S.lastMode == S.MODE_DIALOGUE or S.lastMode == S.MODE_OPTIONS then
-            log("dialogue ended after %.1fs (widget-gone)", os.clock() - (S.dlgClock or os.clock()))
+                log("dialogue: end %.1fs (widget-gone)", os.clock() - (S.dlgClock or os.clock()))
         end
         E.notify(S.MODE_NONE, "no dialogue")
         S.setState("IDLE", "widget-gone")
@@ -72,17 +84,15 @@ local function tick()
         S.skipFlight = nil
         S.lineSig = nil
         S.skipBtnDone = nil
-        S.lastSkipBtnSig = nil
-        S.skipBtnBlocked = nil
         S.skipPromptHidden = nil
         if S.endStrikes >= S.END_STRIKES_NEEDED then
             S.endStrikes = 0
             S.dialogueOver = true
             S.graphFrozen = false
             S.freezeAt = nil
-            log("quiet (dialogue over)")
+            log("dialogue: quiet (over)")
             if S.lastMode == S.MODE_DIALOGUE or S.lastMode == S.MODE_OPTIONS then
-                log("dialogue ended after %.1fs (active-gone)", os.clock() - (S.dlgClock or os.clock()))
+                log("dialogue: end %.1fs (active-gone)", os.clock() - (S.dlgClock or os.clock()))
             end
             E.notify(S.MODE_NONE, "no dialogue")
             S.setState("OVER", "active-gone")
@@ -95,13 +105,6 @@ local function tick()
     end
     if not S.graphFrozen then S.endStrikes = 0 end
 
-    if S.choiceHookAt ~= nil and not S.graphFrozen then
-        local at = S.choiceHookAt
-        S.choiceHookAt = nil
-        local _, gH = resolve(S.seenDialogue)
-        local hH = (gH ~= nil) and Try(function() return gH:GetHoveredButtonIndex() end) or nil
-        log("choice hook: hover=%s", tostring(hH))
-    end
     -- Widget deactivation signals teardown or handover and a graph rebuild; freeze until it reactivates.
     local actSig = nil
     do
@@ -110,46 +113,26 @@ local function tick()
             local a = Try(function() return dlgA:IsActivated() end)
             if a ~= nil then actSig = tostring(a) end
         end
-        if actSig ~= S.lastActiveSig then
-            S.lastActiveSig = actSig
-            log("active: %s", tostring(actSig))
-        end
     end
     -- Freeze on deactivation; validate once at the danger point.
     if actSig == "false" then
         if not S.dialogueOver and not S.graphFrozen then
             S.graphFrozen = true
             S.freezeAt = now
-            log("graph inactive")
+            log("graph: frozen (widget inactive)")
             U.refreshAnchor()
         end
     elseif actSig == "true" then
         if S.graphFrozen then
             S.graphFrozen = false
             S.freezeAt = nil
-            log("graph active")
+            log("graph: thawed")
         end
     end
     -- Hard freeze: only the pause poll runs. Child widgets may be dead; all dialogue side work waits for thaw.
     if S.graphFrozen then
         if S.pausePollInit == nil or (tickCount % 4) == 1 then P.readPauseMenu() end
         return
-    end
-    -- Log IsDialogueActive beside gone-strikes using existing reads. Log disagreements; safety gates still rely on strikes.
-    do
-        local dlgI = S.seenDialogue
-        local ia = nil
-        if Usable(dlgI) then
-            local csI = Try(function() return dlgI.CinematicSystem end)
-            if Usable(csI) then
-                ia = Try(function() return csI:IsDialogueActive() end)
-            end
-        end
-        local iaSig = "isactive=" .. tostring(ia)
-        if iaSig ~= S.lastActiveFlagSig then
-            S.lastActiveFlagSig = iaSig
-            log("activeflag: %s", iaSig)
-        end
     end
     -- Skip-button state is read-only: check immediately, then at 1 Hz. Fast skips can end a dialogue in about a second; the widget is per conversation.
     if S.skipBtnDone == nil or (tickCount % 4) == 1 then P.readSkipButton() end
@@ -159,30 +142,24 @@ local function tick()
     if S.pausePollInit == nil or (tickCount % 4) == 1 then P.readPauseMenu() end
 
     local pausedTick = S.escPauseArmed or S.menuOpen
-    -- Prompt block/hide: independent one shots, max one game call per tick.
-    -- Block only in one-press Space mode; two-press stays native.
-    if not pausedTick and S.started and (tickCount % 4) == 1
-        and ((E.spaceOn() and not settings.TwoPress and S.skipBtnBlocked == nil)
-            or (settings.HidePrompt and S.skipPromptHidden == nil)) then
-        local dlgB = S.seenDialogue
-        if Usable(dlgB) then
-            local btnB = Try(function() return dlgB.SkipButtonWidget end)
-            if Usable(btnB) then
-                if E.spaceOn() and not settings.TwoPress and S.skipBtnBlocked == nil then
-                    local okB, errB = pcall(function() btnB:SetBlocked(true) end)
-                    log("skipblock: ok=%s %s", tostring(okB),
-                        okB and "" or tostring(errB))
-                    S.skipBtnBlocked = true
-                elseif settings.HidePrompt and S.skipPromptHidden == nil then
-                    local okH, errH = pcall(function() btnB:SetVisibility(1) end)
-                    log("skipprompt: hidden ok=%s %s", tostring(okH),
-                        okH and "" or tostring(errH))
-                    S.skipPromptHidden = true
-                end
-            else
-                if S.skipBtnBlocked == nil then S.skipBtnBlocked = true end
-                if S.skipPromptHidden == nil then S.skipPromptHidden = true end
-                log("skipbtn-write: widget unreadable")
+    -- Prompt hide: collapse the prompt widget, nothing else. SetBlocked is not
+    -- used because it runs game-side code that dereferences a null
+    -- InputActionWidget before the prompt is armed. Collapsing only changes
+    -- Slate visibility, and the prompt never writes its own visibility back
+    -- (vis stays 4 on live dialogues), so one write per dialogue holds.
+    if not pausedTick and S.started and settings.HidePrompt
+        and not settings.TwoPress and S.skipPromptHidden == nil then
+        local dlgH = S.seenDialogue
+        if Usable(dlgH) then
+            local btnH = Try(function() return dlgH.SkipButtonWidget end)
+            if Usable(btnH) then
+                local before = Try(function() return btnH:GetVisibility() end)
+                local okH, errH = pcall(function() btnH:SetVisibility(1) end)
+                local after = Try(function() return btnH:GetVisibility() end)
+                log("prompt hide: %s -> %s ok=%s %s", tostring(before),
+                    tostring(after), tostring(okH),
+                    okH and "" or tostring(errH))
+                if okH then S.skipPromptHidden = true end
             end
         end
     end
@@ -191,12 +168,11 @@ local function tick()
     if S.graphFrozen and shown then
         S.graphFrozen = false
         S.freezeAt = nil
-        log("graph list")
+        log("graph: thawed (list)")
     end
     if shown then
         if S.lastMode ~= S.MODE_OPTIONS then
             S.state2Clock = os.clock()
-            S.waitTick = 0
             S.primeArrowDone = false
             S.quietTickLogged = false
             S.timedChoice = nil
@@ -206,7 +182,11 @@ local function tick()
             S.refocusFails = 0
             S.refocusGaveUp = false
             S.focusProbeDone = false
-            P.resetChoiceProbe()
+            log("choice: list n=%d vis=%s", n, tostring(vis))
+            if S.pendingSpace ~= nil then
+                S.pendingSpace = nil
+                log("skip: deferred blocked (list)")
+            end
             if S.skipFlight ~= nil then
                 S.skipFlight = nil
                 S.lineSig = nil
@@ -214,7 +194,6 @@ local function tick()
             end
         end
         E.notify(S.MODE_OPTIONS, string.format("%d reply options visible (vis=%s)", n, tostring(vis)))
-        if settings.Log then P.readChoiceProbe() end
 
         if S.menuOpen then
             S.setState("PAUSED", "menu-over-list")
@@ -241,45 +220,16 @@ local function tick()
             elseif h ~= -1 then
                 src = "wheel/mouse"
             end
-            log("hovered %s -> %s (%s)", tostring(S.lastHover), tostring(h), src)
+            log("choice: hover %s -> %s (%s)", tostring(S.lastHover), tostring(h), src)
             S.lastHover = h
-            S.waitTick = 0
             S.refocusFails = 0
             S.refocusGaveUp = false
-        elseif h == -1 then
-        -- Log every 1s while options hang without a hover, exposing dead stretches.
-            S.waitTick = S.waitTick + 1
-            if not pausedTick and S.waitTick % 4 == 0 then
-                log("waiting hover T+%.1fs (n=%s vis=%s)",
-                    os.clock() - (S.state2Clock or os.clock()),
-                    tostring(n), tostring(vis))
-            end
         end
-        -- Poll focus alongside hover: hover=N, mouse=false indicates keyboard navigation.
-        local fsig = nil
+        -- Focus state gates the hover priming and the recovery request below.
         local descFocused = nil
-        if g ~= nil then
-            local moused, kbdf, descd = "?", "?", "?"
-            if h ~= nil and h >= 0 then
-                local bb = Try(function() return g:GetButtonBaseAtIndex(h) end)
-                if Usable(bb) then
-                    local m = Try(function() return bb:IsHovered() end)
-                    local k = Try(function() return bb:HasKeyboardFocus() end)
-                    if m ~= nil then moused = tostring(m) end
-                    if k ~= nil then kbdf = tostring(k) end
-                end
-            end
-            if cw ~= nil then
-                local d = Try(function() return cw:HasFocusedDescendants() end)
-                if d ~= nil then descd = tostring(d) end
-                descFocused = (d == true)
-            end
-            fsig = string.format("h=%s mouse=%s kbd=%s desc=%s",
-                tostring(h), moused, kbdf, descd)
-        end
-        if fsig ~= nil and fsig ~= S.lastFocusSig then
-            S.lastFocusSig = fsig
-            log("input: %s", fsig)
+        if g ~= nil and cw ~= nil then
+            local d = Try(function() return cw:HasFocusedDescendants() end)
+            if d ~= nil then descFocused = (d == true) end
         end
 
         -- Anti-spam: leave the list untouched while clicks continue.
@@ -295,20 +245,16 @@ local function tick()
             if spamHeld then
                 if not S.quietTickLogged then
                     S.quietTickLogged = true
-                    log("prime-arrow held (spam-quiet %dms<%dms)",
+                    log("choice: prime held (spam-quiet %dms<%dms)",
                         math.floor(quietMs), S.QUIET_MS)
                 end
             else
                 S.primeArrowDone = true
                 S.arrowClock = os.clock()
                 local okP, errP = pcall(E.native.prime)
-                log("prime-arrow fired (hover=%s) ok=%s %s", tostring(h),
+                log("choice: prime (hover=%s) ok=%s %s", tostring(h),
                     tostring(okP), okP and "" or tostring(errP))
             end
-        end
-        
-        if not pausedTick and (tickCount % 20) == 0 then
-            log("holding hover=%s %s", tostring(S.lastHover), tostring(S.lastFocusSig))
         end
         -- Clicks steal Slate focus, breaking wheel/arrows; re-hover restores it. The kbd column confirms recovery.
         if not pausedTick and h ~= nil and h >= 0 and g ~= nil then
@@ -325,13 +271,13 @@ local function tick()
                 local bR = Try(function() return g:GetButtonBaseAtIndex(h) end)
                 if Usable(bR) then
                     local okR, errR = pcall(function() g:OnButtonBaseHovered(bR) end)
-                    log("refocus (hover=%d) ok=%s %s", h, tostring(okR),
+                    log("choice: refocus (hover=%d) ok=%s %s", h, tostring(okR),
                         okR and "" or tostring(errR))
                     if okR then
                         S.refocusFails = S.refocusFails + 1
                         if S.refocusFails >= S.REFOCUS_MISSES then
                             S.refocusGaveUp = true
-                            log("refocus giving up (%d misses)", S.refocusFails)
+                            conf.warn("choice: refocus gave up (%d misses)", S.refocusFails)
                         end
                     end
                 end
@@ -350,7 +296,7 @@ local function tick()
             if Usable(dlgP) then
                 okW, errW = pcall(function() dlgP:RequestRefreshFocus() end)
             end
-            log("focus probe: RequestRefreshFocus ok=%s %s", tostring(okW),
+            log("choice: focus refresh ok=%s %s", tostring(okW),
                 okW and "" or tostring(errW))
         end
         -- Detect visible timers once per list; bypass confirm delay since the game auto-picks.
@@ -359,22 +305,30 @@ local function tick()
             S.timedChoice = P.readTimedChoice()
             if S.timedChoice then
                 S.timedWatchT0 = now
-                local rem = P.readTimedRemaining()
-                if rem ~= nil then
-                    log("timed choice: quiet off (remain=%s)", tostring(rem))
-                else
-                    log("timed choice: quiet off")
+                local info = P.timedInfo() or {}
+                local total = info.total
+                local node = type(info.node) == "string" and info.node:sub(1, 40) or "?"
+                local dlgShort = type(S.dlgPath) == "string" and S.dlgPath:match("([^%.]+)$") or "?"
+                log("timer: start dlg=%s node=%s total=%ss wanted=%ss override=%s authored=%ss",
+                    dlgShort, node, tostring(total), tostring(settings.TimerExtendSec),
+                    tostring(info.override), tostring(info.authored))
+                if settings.TimerExtendSec > 0 and type(total) == "number"
+                    and math.abs(total - settings.TimerExtendSec) > 0.5 then
+                    log("timer: NOT extended (total=%ss, wanted=%ss)",
+                        tostring(total), tostring(settings.TimerExtendSec))
                 end
             end
         end
-        
+        -- Heartbeat once per second while a timed choice runs: shows the game's
+        -- own countdown, which is what the extension setting changes.
         if S.timedChoice == true and not pausedTick and (tickCount % 4) == 1 then
-            local remLive = P.readTimedRemaining()
+            local remLive, durLive = P.readTimedRemaining()
             if remLive ~= nil then
                 local elap = (S.timedWatchT0 ~= nil) and (now - S.timedWatchT0) or -1
-                log("timed watch: T+%.0fs remain=%s", elap, tostring(remLive))
+                log("timer: remain=%s (T+%.0fs)", timerLeft(remLive, durLive), elap)
             end
         end
+
         if S.firstUnlocked == nil and not S.graphFrozen then
             S.firstUnlocked = P.readFirstUnlocked()
         end
@@ -383,8 +337,6 @@ local function tick()
             P.readSlotMap()
         end
     else
-        S.waitTick = 0
-        S.lastFocusSig = nil
         S.primeArrowDone = nil
         S.quietTickLogged = false
         S.arrowClock = nil
@@ -392,7 +344,6 @@ local function tick()
         S.timedWatchT0 = nil
         S.firstUnlocked = nil
         S.slotMapDone = nil
-        P.resetChoiceProbe()
         if S.lastHover ~= nil then S.lastHover = nil end
         -- Focus-back detects menu closure (ESC/Continue); uses the shared transition and clock freeze
         if S.menuOpen then
@@ -415,28 +366,28 @@ local function tick()
 
         if not S.started and S.lineGuid ~= nil and S.lineGuid ~= "no-response" then
             S.started = true
-            log("dialogue started (first line)")
+            log("dialogue: start")
         end
-        -- Line change confirms progress. Timeout alone never releases the skip gate: hammering skips into silence crashed the game.
+        -- Line change confirms progress. Timeout alone never releases the skip gate: a skip into silence can crash the game.
         if S.skipFlight ~= nil then
             if S.skipFlight.sig == nil and S.lineSig ~= nil and S.lineSig ~= "no-response" then
                 S.skipFlight.sig = S.lineSig
                 log("flight adopted (was blind)")
             end
-            if S.lineSig ~= nil and S.skipFlight.sig ~= nil and S.lineSig ~= S.skipFlight.sig then
-                log("flight confirmed (progress)")
+            if S.lineSig ~= nil and S.lineSig ~= "no-response"
+                and S.skipFlight.sig ~= nil and S.lineSig ~= S.skipFlight.sig then
                 S.skipFlight = nil
             elseif (now - S.skipFlight.t) > S.FLIGHT_HOLD then
-                log("flight hold expired")
+                log("flight: hold expired")
                 S.skipFlight = nil
             elseif S.skipFlight.sig == nil then
                 if (now - S.skipFlight.t) > S.FLIGHT_BLIND_TIMEOUT and not S.skipFlight.held then
                     S.skipFlight.held = true
-                    log("flight timeout, holding (blind)")
+                    log("flight: blind timeout, holding")
                 end
             elseif (now - S.skipFlight.t) > S.FLIGHT_TIMEOUT and not S.skipFlight.held then
                 S.skipFlight.held = true
-                log("flight timeout, holding")
+                log("flight: timeout, holding")
             end
         end
         E.notify(S.MODE_DIALOGUE, "dialogue open")
@@ -448,7 +399,7 @@ local function tick()
             S.setState("APPEARED", "waiting-first-line")
             if not S.stuckStartWarned and (now - (S.dlgClock or now)) > 30 then
                 S.stuckStartWarned = true
-                log("watchdog: no first line %.0fs after appear", now - (S.dlgClock or now))
+                conf.warn("dialogue: no first line after %.0fs", now - (S.dlgClock or now))
             end
         else
             if not S.graphFrozen then
